@@ -1,5 +1,7 @@
 #include <ctype.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -8,12 +10,17 @@
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include "pmbus_commands.h"
+#include "tps546.h"
 
 #define TAG "bonanza-test"
 
@@ -74,6 +81,17 @@ static void print_help(void)
     printf("  rst <0|1>         Set ASIC reset control\n");
     printf("  fan <0-100>       Set fan PWM percentage\n");
     printf("  tach              Read fan tach RPM\n");
+    printf("  vr help           Show TPS546D24S commands\n");
+    printf("  vr probe          Read TPS546D24S device ID over I2C\n");
+    printf("  vr pgood          Read VR PGOOD pin and enable pin state\n");
+    printf("  vr status         Read TPS546 status/fault registers\n");
+    printf("  vr telem          Read TPS546 telemetry\n");
+    printf("  vr clear          Clear TPS546 faults\n");
+    printf("  vr cfg read       Read back key TPS546 config registers\n");
+    printf("  vr cfg write      Write TPS546_CONFIG_BIRDS PMBus settings\n");
+    printf("  vr bringup        Python-style BIRDS bring-up: off, clear, cfg, enable, on\n");
+    printf("  vr pin <0|1>      Drive the VR enable pin on GPIO10\n");
+    printf("  vr op <0|1>       Write PMBus OPERATION off/on\n");
     printf("  pattern           Send default 9-bit test pattern on data UART\n");
     printf("  send9 <...>       Send one or more 9-bit words, ex: send9 0x155 0x0aa\n");
     printf("  raw <...>         Send raw byte stream on data UART, ex: raw 55 01 aa 00\n");
@@ -81,7 +99,27 @@ static void print_help(void)
     printf("\n");
     printf("Control UART: UART0 TX GPIO43, RX GPIO44 @ 115200\n");
     printf("Data UART:    UART1 TX GPIO17, RX GPIO18 @ 5000000\n");
+    printf("VR I2C:       SDA GPIO47, SCL GPIO48, EN GPIO10, PGOOD GPIO11\n");
     printf("\n");
+}
+
+static esp_err_t init_console_io(void)
+{
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t config = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+        ESP_RETURN_ON_ERROR(usb_serial_jtag_driver_install(&config), TAG, "usb_serial_jtag driver install failed");
+    }
+
+    usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_CR);
+    usb_serial_jtag_vfs_set_tx_line_endings(ESP_LINE_ENDINGS_CRLF);
+    usb_serial_jtag_vfs_use_driver();
+
+    setvbuf(stdin, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    fcntl(fileno(stdin), F_SETFL, 0);
+    fcntl(fileno(stdout), F_SETFL, 0);
+
+    return ESP_OK;
 }
 
 static esp_err_t uart_init_port(uart_port_t port, int tx_pin, int rx_pin, int baudrate, int buf_size)
@@ -106,6 +144,7 @@ static esp_err_t init_interfaces(void)
 {
     ESP_ERROR_CHECK(uart_init_port(CONTROL_UART_PORT, CONTROL_UART_TX_PIN, CONTROL_UART_RX_PIN, CONTROL_UART_BAUDRATE, CONTROL_UART_BUF_SIZE));
     ESP_ERROR_CHECK(uart_init_port(DATA_UART_PORT, DATA_UART_TX_PIN, DATA_UART_RX_PIN, DATA_UART_BAUDRATE, DATA_UART_BUF_SIZE));
+    ESP_ERROR_CHECK(tps546_init());
     return ESP_OK;
 }
 
@@ -312,6 +351,654 @@ static void cmd_get_tach(void)
     }
 }
 
+static void print_vr_help(void)
+{
+    printf("vr commands:\n");
+    printf("  vr probe          Read device ID from I2C address 0x%02X\n", TPS546_I2C_ADDRESS);
+    printf("  vr pgood          Read PGOOD and VR enable GPIO state\n");
+    printf("  vr status         Read PMBus status registers and control state\n");
+    printf("  vr telem          Read VIN/VOUT/IOUT/TEMP telemetry\n");
+    printf("  vr clear          Clear sticky PMBus faults\n");
+    printf("  vr cfg read       Read back key TPS546 config registers\n");
+    printf("  vr cfg write      Write TPS546_CONFIG_BIRDS register set\n");
+    printf("  vr bringup        Run Python-style TPS546_CONFIG_BIRDS bring-up\n");
+    printf("  vr pin <0|1>      Drive GPIO10 low/high\n");
+    printf("  vr op <0|1>       Write PMBus OPERATION off/on\n");
+}
+
+static void print_status_word_decode(uint16_t status_word)
+{
+    printf("[status_word_bits]\n");
+    printf("VOUT_FAULT=%s\n", (status_word & TPS546_STATUS_VOUT) ? "set: see STATUS_VOUT" : "clear");
+    printf("IOUT_FAULT=%s\n", (status_word & TPS546_STATUS_IOUT) ? "set: see STATUS_IOUT" : "clear");
+    printf("INPUT_FAULT=%s\n", (status_word & TPS546_STATUS_INPUT) ? "set: see STATUS_INPUT" : "clear");
+    printf("MFR_FAULT=%s\n", (status_word & TPS546_STATUS_MFR) ? "set: see STATUS_MFR_SPECIFIC" : "clear");
+    printf("PGOOD_STATUS=%s\n", (status_word & TPS546_STATUS_PGOOD) ? "fault: output not in regulation" : "ok: output in regulation");
+    printf("OTHER_FAULT=%s\n", (status_word & TPS546_STATUS_OTHER) ? "set: see STATUS_OTHER" : "clear");
+    printf("BUSY=%s\n", (status_word & TPS546_STATUS_BUSY) ? "set: device busy" : "clear: ready");
+    printf("OFF=%s\n", (status_word & TPS546_STATUS_OFF) ? "set: not converting" : "clear: enabled/converting");
+    printf("VOUT_OV=%s\n", (status_word & TPS546_STATUS_VOUT_OV) ? "set" : "clear");
+    printf("IOUT_OC=%s\n", (status_word & TPS546_STATUS_IOUT_OC) ? "set" : "clear");
+    printf("VIN_UV=%s\n", (status_word & TPS546_STATUS_VIN_UV) ? "set" : "clear");
+    printf("TEMP=%s\n", (status_word & TPS546_STATUS_TEMP) ? "set" : "clear");
+    printf("CML=%s\n", (status_word & TPS546_STATUS_CML) ? "set" : "clear");
+    printf("NONE_OF_THE_ABOVE=%s\n", (status_word & TPS546_STATUS_NONE) ? "set" : "clear");
+}
+
+static float decode_slinear11(uint16_t value)
+{
+    int exponent;
+    int mantissa;
+
+    if (value & 0x8000) {
+        exponent = -1 * ((((int)(~value)) >> 11 & 0x1F) + 1);
+    } else {
+        exponent = (int)(value >> 11);
+    }
+
+    if (value & 0x0400) {
+        mantissa = -1 * ((((int)(~value)) & 0x03FF) + 1);
+    } else {
+        mantissa = (int)(value & 0x03FF);
+    }
+
+    return (float)mantissa * powf(2.0f, (float)exponent);
+}
+
+static float decode_ulinear16(uint16_t value, uint8_t vout_mode)
+{
+    int exponent;
+
+    if (vout_mode & 0x10) {
+        exponent = -1 * ((((int)(~vout_mode)) & 0x1F) + 1);
+    } else {
+        exponent = (int)(vout_mode & 0x1F);
+    }
+
+    return (float)value * powf(2.0f, (float)exponent);
+}
+
+static void print_hex_array(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        printf("%s%02X", i == 0 ? "" : " ", data[i]);
+    }
+}
+
+static void cmd_vr_probe(void)
+{
+    tps546_device_id_t device;
+    esp_err_t err = tps546_probe(&device);
+
+    if (err != ESP_OK) {
+        printf("vr probe failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("TPS546 device ID:");
+    for (size_t i = 0; i < sizeof(device.id); i++) {
+        printf(" %02X", device.id[i]);
+    }
+    printf(" -> %s\n", device.name);
+}
+
+static void cmd_vr_pgood(void)
+{
+    printf("vr enable_pin=%u pgood=%u\n", tps546_get_enable_pin() ? 1 : 0, tps546_get_pgood_pin() ? 1 : 0);
+}
+
+static void cmd_vr_status(void)
+{
+    tps546_status_snapshot_t status;
+    esp_err_t err = tps546_read_status(&status);
+
+    if (err != ESP_OK) {
+        printf("vr status failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("[status_raw]\n");
+    printf("STATUS_WORD=0x%04X\n", status.status_word);
+    printf("STATUS_VOUT=0x%02X\n", status.status_vout);
+    printf("STATUS_IOUT=0x%02X\n", status.status_iout);
+    printf("STATUS_INPUT=0x%02X\n", status.status_input);
+    printf("STATUS_TEMPERATURE=0x%02X\n", status.status_temperature);
+    printf("STATUS_CML=0x%02X\n", status.status_cml);
+    printf("STATUS_OTHER=0x%02X\n", status.status_other);
+    printf("STATUS_MFR_SPECIFIC=0x%02X\n", status.status_mfr_specific);
+
+    printf("\n[control]\n");
+    printf("OPERATION=0x%02X\n", status.operation);
+    printf("ON_OFF_CONFIG=0x%02X\n", status.on_off_config);
+
+    printf("\n[pins]\n");
+    printf("ENABLE_PIN=%u\n", status.enable_pin_high ? 1 : 0);
+    printf("PGOOD_PIN=%u\n", status.pgood_pin_high ? 1 : 0);
+
+    printf("\n");
+    print_status_word_decode(status.status_word);
+}
+
+static void cmd_vr_telem(void)
+{
+    tps546_telemetry_t telemetry;
+    esp_err_t err = tps546_read_telemetry(&telemetry);
+
+    if (err != ESP_OK) {
+        printf("vr telem failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("VOUT_MODE=0x%02X VIN=%.3fV VOUT=%.3fV IOUT=%.3fA TEMP=%.1fC\n",
+           telemetry.vout_mode,
+           telemetry.read_vin,
+           telemetry.read_vout,
+           telemetry.read_iout,
+           telemetry.read_temperature_c);
+}
+
+static void cmd_vr_clear(void)
+{
+    esp_err_t err = tps546_clear_faults();
+    if (err != ESP_OK) {
+        printf("vr clear failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("vr faults cleared\n");
+}
+
+static void cmd_vr_cfg_read(void)
+{
+    uint8_t vout_mode = 0;
+    uint8_t phase = 0;
+    uint8_t sync_config = 0;
+    uint8_t device_address = 0;
+    uint8_t power_stage_config[1] = {0};
+    uint8_t telemetry_config[6] = {0};
+    uint8_t compensation_config[5] = {0};
+    uint8_t smbalert_vout = 0;
+    uint8_t smbalert_iout = 0;
+    uint8_t smbalert_input = 0;
+    uint8_t smbalert_temp = 0;
+    uint8_t smbalert_cml = 0;
+    uint8_t smbalert_other = 0;
+    uint8_t smbalert_mfr = 0;
+    uint16_t word = 0;
+    esp_err_t err;
+
+    err = tps546_read_byte_reg(PMBUS_VOUT_MODE, &vout_mode);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    err = tps546_read_byte_reg(PMBUS_PHASE, &phase);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_smbalert_mask(PMBUS_STATUS_VOUT_SELECTOR, &smbalert_vout);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_smbalert_mask(PMBUS_STATUS_IOUT_SELECTOR, &smbalert_iout);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_smbalert_mask(PMBUS_STATUS_INPUT_SELECTOR, &smbalert_input);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_smbalert_mask(PMBUS_STATUS_TEMPERATURE_SELECTOR, &smbalert_temp);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_smbalert_mask(PMBUS_STATUS_CML_SELECTOR, &smbalert_cml);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_smbalert_mask(PMBUS_STATUS_OTHER_SELECTOR, &smbalert_other);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_smbalert_mask(PMBUS_STATUS_MFR_SPECIFIC_SELECTOR, &smbalert_mfr);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    err = tps546_read_word_reg(PMBUS_FREQUENCY_SWITCH, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("[core]\n");
+    printf("PHASE=0x%02X\n", phase);
+    printf("VOUT_MODE=0x%02X\n", vout_mode);
+    printf("FREQUENCY_SWITCH=0x%04X (%.0fkHz)\n", word, decode_slinear11(word));
+    printf("SMBALERT_MASK_VOUT=0x%02X\n", smbalert_vout);
+    printf("SMBALERT_MASK_IOUT=0x%02X\n", smbalert_iout);
+    printf("SMBALERT_MASK_INPUT=0x%02X\n", smbalert_input);
+    printf("SMBALERT_MASK_TEMP=0x%02X\n", smbalert_temp);
+    printf("SMBALERT_MASK_CML=0x%02X\n", smbalert_cml);
+    printf("SMBALERT_MASK_OTHER=0x%02X\n", smbalert_other);
+    printf("SMBALERT_MASK_MFR=0x%02X\n", smbalert_mfr);
+
+    err = tps546_read_byte_reg(PMBUS_SYNC_CONFIG, &sync_config);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_word_reg(PMBUS_STACK_CONFIG, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[topology]\n");
+    printf("SYNC_CONFIG=0x%02X\n", sync_config);
+    printf("STACK_CONFIG=0x%04X\n", word);
+    err = tps546_read_word_reg(PMBUS_INTERLEAVE, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("INTERLEAVE=0x%04X\n", word);
+    err = tps546_read_word_reg(PMBUS_MISC_OPTIONS, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("MISC_OPTIONS=0x%04X\n", word);
+    err = tps546_read_word_reg(PMBUS_PIN_DETECT_OVERRIDE, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("PIN_DETECT_OVERRIDE=0x%04X\n", word);
+
+    err = tps546_read_byte_reg(PMBUS_SLAVE_ADDRESS, &device_address);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_block_reg(PMBUS_COMPENSATION_CONFIG, compensation_config, sizeof(compensation_config));
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_block_reg(PMBUS_POWER_STAGE_CONFIG, power_stage_config, sizeof(power_stage_config));
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    err = tps546_read_block_reg(PMBUS_TELEMETRY_CONFIG, telemetry_config, sizeof(telemetry_config));
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[device]\n");
+    printf("SLAVE_ADDRESS=0x%02X\n", device_address);
+    printf("COMPENSATION_CONFIG=[");
+    print_hex_array(compensation_config, sizeof(compensation_config));
+    printf("]\n");
+    printf("POWER_STAGE_CONFIG=0x%02X\n", power_stage_config[0]);
+    printf("TELEMETRY_CONFIG=[");
+    print_hex_array(telemetry_config, sizeof(telemetry_config));
+    printf("]\n");
+
+    err = tps546_read_word_reg(PMBUS_VOUT_COMMAND, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[vout]\n");
+    printf("VOUT_COMMAND=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+    err = tps546_read_word_reg(PMBUS_VOUT_TRIM, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_TRIM=0x%04X\n", word);
+    err = tps546_read_word_reg(PMBUS_VOUT_MAX, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_MAX=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+
+    err = tps546_read_word_reg(PMBUS_VOUT_MARGIN_HIGH, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_MARGIN_HIGH=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+    err = tps546_read_word_reg(PMBUS_VOUT_MARGIN_LOW, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_MARGIN_LOW=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+    err = tps546_read_word_reg(PMBUS_VOUT_TRANSITION_RATE, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_TRANSITION_RATE=0x%04X\n", word);
+
+    err = tps546_read_word_reg(PMBUS_VOUT_SCALE_LOOP, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_SCALE_LOOP=0x%04X (%.3f)\n", word, decode_slinear11(word));
+    err = tps546_read_word_reg(PMBUS_VOUT_MIN, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_MIN=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+
+    err = tps546_read_word_reg(PMBUS_VIN_ON, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[vin]\n");
+    printf("VIN_ON=0x%04X (%.3fV)\n", word, decode_slinear11(word));
+    err = tps546_read_word_reg(PMBUS_VIN_OFF, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VIN_OFF=0x%04X (%.3fV)\n", word, decode_slinear11(word));
+
+    err = tps546_read_word_reg(PMBUS_IOUT_CAL_GAIN, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[calibration]\n");
+    printf("IOUT_CAL_GAIN=0x%04X\n", word);
+    err = tps546_read_word_reg(PMBUS_IOUT_CAL_OFFSET, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("IOUT_CAL_OFFSET=0x%04X\n", word);
+
+    err = tps546_read_word_reg(PMBUS_VOUT_OV_FAULT_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[faults_vout]\n");
+    printf("VOUT_OV_FAULT_LIMIT=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+    err = tps546_read_byte_reg(PMBUS_VOUT_OV_FAULT_RESPONSE, &phase);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_OV_FAULT_RESPONSE=0x%02X\n", phase);
+
+    err = tps546_read_word_reg(PMBUS_VOUT_OV_WARN_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_OV_WARN_LIMIT=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+    err = tps546_read_word_reg(PMBUS_VOUT_UV_WARN_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_UV_WARN_LIMIT=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+    err = tps546_read_word_reg(PMBUS_VOUT_UV_FAULT_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_UV_FAULT_LIMIT=0x%04X (%.3f)\n", word, decode_ulinear16(word, vout_mode));
+
+    err = tps546_read_byte_reg(PMBUS_VOUT_UV_FAULT_RESPONSE, &phase);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VOUT_UV_FAULT_RESPONSE=0x%02X\n", phase);
+
+    printf("\n[faults_iout]\n");
+    err = tps546_read_word_reg(PMBUS_IOUT_OC_FAULT_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("IOUT_OC_FAULT_LIMIT=0x%04X (%.3fA)\n", word, decode_slinear11(word));
+
+    err = tps546_read_byte_reg(PMBUS_IOUT_OC_FAULT_RESPONSE, &phase);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("IOUT_OC_FAULT_RESPONSE=0x%02X\n", phase);
+    err = tps546_read_word_reg(PMBUS_IOUT_OC_WARN_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("IOUT_OC_WARN_LIMIT=0x%04X (%.3fA)\n", word, decode_slinear11(word));
+
+    err = tps546_read_word_reg(PMBUS_OT_FAULT_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[faults_temp]\n");
+    printf("OT_FAULT_LIMIT=0x%04X (%.1fC)\n", word, decode_slinear11(word));
+    err = tps546_read_byte_reg(PMBUS_OT_FAULT_RESPONSE, &phase);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("OT_FAULT_RESPONSE=0x%02X\n", phase);
+    err = tps546_read_word_reg(PMBUS_OT_WARN_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("OT_WARN_LIMIT=0x%04X (%.1fC)\n", word, decode_slinear11(word));
+
+    err = tps546_read_word_reg(PMBUS_VIN_OV_FAULT_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[faults_vin]\n");
+    printf("VIN_OV_FAULT_LIMIT=0x%04X (%.3fV)\n", word, decode_slinear11(word));
+    err = tps546_read_byte_reg(PMBUS_VIN_OV_FAULT_RESPONSE, &phase);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VIN_OV_FAULT_RESPONSE=0x%02X\n", phase);
+    err = tps546_read_word_reg(PMBUS_VIN_UV_WARN_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("VIN_UV_WARN_LIMIT=0x%04X (%.3fV)\n", word, decode_slinear11(word));
+
+    err = tps546_read_word_reg(PMBUS_TON_DELAY, &word);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("\n[timing]\n");
+    printf("TON_DELAY=0x%04X (%.1fms)\n", word, decode_slinear11(word));
+    err = tps546_read_word_reg(PMBUS_TON_RISE, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("TON_RISE=0x%04X (%.1fms)\n", word, decode_slinear11(word));
+    err = tps546_read_word_reg(PMBUS_TON_MAX_FAULT_LIMIT, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("TON_MAX_FAULT_LIMIT=0x%04X (%.1fms)\n", word, decode_slinear11(word));
+
+    err = tps546_read_byte_reg(PMBUS_TON_MAX_FAULT_RESPONSE, &phase);
+    if (err != ESP_OK) {
+        printf("vr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("TON_MAX_FAULT_RESPONSE=0x%02X\n", phase);
+    err = tps546_read_word_reg(PMBUS_TOFF_DELAY, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("TOFF_DELAY=0x%04X (%.1fms)\n", word, decode_slinear11(word));
+    err = tps546_read_word_reg(PMBUS_TOFF_FALL, &word);
+    if (err != ESP_OK) {
+        printf("\nvr cfg read failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+    printf("TOFF_FALL=0x%04X (%.1fms)\n", word, decode_slinear11(word));
+}
+
+static void cmd_vr_cfg_write(void)
+{
+    esp_err_t err = tps546_configure_birds();
+    if (err != ESP_OK) {
+        printf("vr cfg write failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("vr cfg write: TPS546_CONFIG_BIRDS applied\n");
+}
+
+static void cmd_vr_bringup(void)
+{
+    esp_err_t err = tps546_bringup_birds();
+    if (err != ESP_OK) {
+        printf("vr bringup failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("vr bringup complete\n");
+    cmd_vr_pgood();
+    cmd_vr_status();
+    cmd_vr_telem();
+}
+
+static void cmd_vr_pin(int level)
+{
+    esp_err_t err;
+
+    if (level != 0 && level != 1) {
+        printf("usage: vr pin <0|1>\n");
+        return;
+    }
+
+    err = tps546_set_enable_pin(level != 0);
+    if (err != ESP_OK) {
+        printf("vr pin failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("vr enable pin -> %d\n", level);
+}
+
+static void cmd_vr_operation(int level)
+{
+    esp_err_t err;
+
+    if (level != 0 && level != 1) {
+        printf("usage: vr op <0|1>\n");
+        return;
+    }
+
+    err = tps546_set_operation(level != 0);
+    if (err != ESP_OK) {
+        printf("vr op failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("vr operation -> %s\n", level ? "ON" : "OFF");
+}
+
+static void cmd_vr(char *args)
+{
+    while (*args == ' ' || *args == '\t') {
+        args++;
+    }
+
+    if (*args == '\0' || strcmp(args, "help") == 0) {
+        print_vr_help();
+        return;
+    }
+
+    if (strcmp(args, "probe") == 0) {
+        cmd_vr_probe();
+        return;
+    }
+
+    if (strcmp(args, "pgood") == 0) {
+        cmd_vr_pgood();
+        return;
+    }
+
+    if (strcmp(args, "status") == 0) {
+        cmd_vr_status();
+        return;
+    }
+
+    if (strcmp(args, "telem") == 0) {
+        cmd_vr_telem();
+        return;
+    }
+
+    if (strcmp(args, "clear") == 0) {
+        cmd_vr_clear();
+        return;
+    }
+
+    if (strcmp(args, "cfg read") == 0) {
+        cmd_vr_cfg_read();
+        return;
+    }
+
+    if (strcmp(args, "cfg write") == 0) {
+        cmd_vr_cfg_write();
+        return;
+    }
+
+    if (strcmp(args, "bringup") == 0) {
+        cmd_vr_bringup();
+        return;
+    }
+
+    if (strncmp(args, "pin ", 4) == 0) {
+        cmd_vr_pin(atoi(&args[4]));
+        return;
+    }
+
+    if (strncmp(args, "op ", 3) == 0) {
+        cmd_vr_operation(atoi(&args[3]));
+        return;
+    }
+
+    printf("unknown vr command: %s\n", args);
+}
+
 static void data_send_bytes(const uint8_t *bytes, size_t len)
 {
     hexdump_bytes("DATA TX", bytes, len);
@@ -397,6 +1084,7 @@ void app_main(void)
     char line[CONSOLE_LINE_MAX];
     size_t line_len = 0;
 
+    ESP_ERROR_CHECK(init_console_io());
     ESP_ERROR_CHECK(init_interfaces());
     xTaskCreate(data_rx_task, "data_rx_task", 4096, NULL, 5, NULL);
 
@@ -428,11 +1116,15 @@ void app_main(void)
         } else if (ch == 0x08 || ch == 0x7f) {
             if (line_len > 0) {
                 line_len--;
+                printf("\b \b");
+                fflush(stdout);
             }
             continue;
         } else {
             if (line_len + 1 < sizeof(line)) {
                 line[line_len++] = (char)ch;
+                putchar(ch);
+                fflush(stdout);
             }
             continue;
         }
@@ -443,6 +1135,10 @@ void app_main(void)
             cmd_gpio_status();
         } else if (strcmp(line, "tach") == 0) {
             cmd_get_tach();
+        } else if (strcmp(line, "vr") == 0) {
+            cmd_vr(&line[2]);
+        } else if (strncmp(line, "vr ", 3) == 0) {
+            cmd_vr(&line[2]);
         } else if (strcmp(line, "pattern") == 0) {
             cmd_pattern();
         } else if (strcmp(line, "flush") == 0) {
