@@ -24,6 +24,8 @@ The current TPS546D24S bring-up pin mapping is:
 | I2C SCL | `GPIO48` |
 | VR enable | `GPIO10` |
 | PGOOD | `GPIO11` |
+| RP2040 SWCLK | `GPIO1` |
+| RP2040 SWDIO | `GPIO2` |
 
 Baudrates:
 
@@ -71,6 +73,8 @@ Type commands into the ESP-IDF monitor:
 - `vr bringup`
 - `vr pin 1`
 - `vr op 1`
+- `rpflash info`
+- `rpswd id`
 - `BZM_sendnoop 0xFA`
 - `BZM_readreg 0xFA 0xFFF 0x0B 4`
 - `BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00`
@@ -97,6 +101,19 @@ The `vr` commands are intended for staged regulator bring-up:
 - `vr op <0|1>` writes the PMBus `OPERATION` register
 
 The harness does not auto-enable the regulator at boot. `GPIO10` is driven low during initialization so regulator bring-up stays explicit.
+
+## RP2040 SWD
+
+The harness now includes the first stage of an ESP32-driven RP2040 programming path:
+
+- `rpflash info` shows the compile-time embedded `bitaxe-raw-bonanza` RP2040 firmware image
+- `rpswd id` bit-bangs SWD on `GPIO1`/`GPIO2`, selects RP2040 core 0, and reads the target `DPIDR`
+
+The embedded RP2040 binary is generated at ESP-IDF build time from:
+
+- `/Users/skot/Bitcoin/bitaxe-raw/bitaxe-raw-bonanza`
+
+using `cargo build --release` and `arm-none-eabi-objcopy -O binary`.
 
 ## ASIC Commands
 

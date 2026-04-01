@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "pmbus_commands.h"
+#include "swd.h"
 #include "tps546.h"
 
 #define TAG "bonanza-test"
@@ -113,6 +114,8 @@ static void print_help(void)
     printf("  vr bringup        Python-style BIRDS bring-up: off, clear, cfg, enable, on\n");
     printf("  vr pin <0|1>      Drive the VR enable pin on GPIO10\n");
     printf("  vr op <0|1>       Write PMBus OPERATION off/on\n");
+    printf("  rpflash info      Show embedded RP2040 firmware image info\n");
+    printf("  rpswd id          Read RP2040 SWD DPIDR over GPIO1/GPIO2\n");
     printf("  BZM_sendnoop <asic>\n");
     printf("                    Send BZM NOOP to ASIC, ex: BZM_sendnoop 0xFA\n");
     printf("  BZM_readreg <asic> <engine> <offset> <count>\n");
@@ -129,6 +132,7 @@ static void print_help(void)
     printf("Control UART: UART0 TX GPIO43, RX GPIO44 @ 115200\n");
     printf("Data UART:    UART1 TX GPIO17, RX GPIO18 @ 5000000\n");
     printf("VR I2C:       SDA GPIO47, SCL GPIO48, EN GPIO10, PGOOD GPIO11\n");
+    printf("RP2040 SWD:   SWCLK GPIO1, SWDIO GPIO2\n");
     printf("\n");
 }
 
@@ -175,8 +179,53 @@ static esp_err_t init_interfaces(void)
     ESP_ERROR_CHECK(uart_init_port(DATA_UART_PORT, DATA_UART_TX_PIN, DATA_UART_RX_PIN, DATA_UART_BAUDRATE, DATA_UART_BUF_SIZE));
     s_data_uart_mutex = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_data_uart_mutex != NULL, ESP_ERR_NO_MEM, TAG, "data uart mutex alloc failed");
+    ESP_ERROR_CHECK(swd_init());
     ESP_ERROR_CHECK(tps546_init());
     return ESP_OK;
+}
+
+static void cmd_rpflash_info(void)
+{
+    printf("embedded rp2040 firmware:\n");
+    printf("  target repo: /Users/skot/Bitcoin/bitaxe-raw/bitaxe-raw-bonanza\n");
+    printf("  targetsel core0:  0x%08" PRIX32 "\n", (uint32_t)RP2040_TARGETSEL_CORE0);
+    printf("  targetsel core1:  0x%08" PRIX32 "\n", (uint32_t)RP2040_TARGETSEL_CORE1);
+    printf("  targetsel rescue: 0x%08" PRIX32 "\n", (uint32_t)RP2040_TARGETSEL_RESCUE);
+    printf("  size: %u bytes\n", (unsigned)swd_embedded_firmware_size());
+}
+
+static void cmd_rpswd_id(void)
+{
+    static const struct {
+        const char *name;
+        uint32_t targetsel;
+    } targets[] = {
+        { "core0", RP2040_TARGETSEL_CORE0 },
+        { "core1", RP2040_TARGETSEL_CORE1 },
+        { "rescue", RP2040_TARGETSEL_RESCUE },
+    };
+    bool any_success = false;
+
+    printf("rp2040 swd probe:\n");
+    for (size_t i = 0; i < (sizeof(targets) / sizeof(targets[0])); i++) {
+        swd_id_result_t result;
+        esp_err_t err = swd_read_target_id(targets[i].targetsel, &result);
+
+        printf("  %s:\n", targets[i].name);
+        printf("    targetsel: 0x%08" PRIX32 "\n", targets[i].targetsel);
+        printf("    ack:       0x%X (%s)\n", result.ack, swd_ack_name(result.ack));
+
+        if (err == ESP_OK) {
+            printf("    dpidr:     0x%08" PRIX32 "\n", result.dpidr);
+            any_success = true;
+        } else {
+            printf("    error:     %s\n", esp_err_to_name(err));
+        }
+    }
+
+    if (!any_success) {
+        printf("rpswd id failed: no RP2040 SWD target responded\n");
+    }
 }
 
 static esp_err_t uart_read_exact(uart_port_t port, uint8_t *buf, size_t len, uint32_t timeout_ms)
@@ -1687,6 +1736,10 @@ void app_main(void)
             cmd_set_rst(atoi(&line[4]));
         } else if (strncmp(line, "fan ", 4) == 0) {
             cmd_set_fan(atoi(&line[4]));
+        } else if (strcmp(line, "rpflash info") == 0) {
+            cmd_rpflash_info();
+        } else if (strcmp(line, "rpswd id") == 0) {
+            cmd_rpswd_id();
         } else if (strncmp(line, "BZM_sendnoop ", 13) == 0) {
             cmd_bzm_sendnoop(&line[13]);
         } else if (strncmp(line, "BZM_readreg ", 12) == 0) {
