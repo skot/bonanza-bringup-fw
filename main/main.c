@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "pmbus_commands.h"
@@ -40,6 +41,9 @@
 #define DATA_UART_BUF_SIZE 4096
 #define CONTROL_RESPONSE_MAX 260
 #define CONSOLE_LINE_MAX 256
+#define BZM_MAX_WRITE_ARGS 68
+#define BZM_MAX_WRITE_WORDS 80
+#define BZM_MAX_READ_WORDS 258
 
 #define CONTROL_PAGE_GPIO 0x06
 #define CONTROL_PAGE_FAN 0x09
@@ -58,6 +62,15 @@ typedef struct {
 } control_response_t;
 
 static uint8_t s_next_command_id = 1;
+static SemaphoreHandle_t s_data_uart_mutex;
+// Shared scratch keeps the interactive main task stack small.
+static uint8_t s_control_framed_response[CONTROL_RESPONSE_MAX];
+static uint8_t s_data_encoded_buf[DATA_UART_BUF_SIZE];
+static uint16_t s_bzm_tx_words[BZM_MAX_WRITE_WORDS];
+static uint16_t s_bzm_rx_words[BZM_MAX_READ_WORDS];
+static uint32_t s_bzm_parsed[BZM_MAX_WRITE_ARGS];
+
+static size_t parse_hex_sequence(char *args, uint32_t *values, size_t max_values, uint32_t max_allowed);
 
 static void hexdump_bytes(const char *prefix, const uint8_t *data, size_t len)
 {
@@ -92,6 +105,12 @@ static void print_help(void)
     printf("  vr bringup        Python-style BIRDS bring-up: off, clear, cfg, enable, on\n");
     printf("  vr pin <0|1>      Drive the VR enable pin on GPIO10\n");
     printf("  vr op <0|1>       Write PMBus OPERATION off/on\n");
+    printf("  BZM_sendnoop <asic>\n");
+    printf("                    Send BZM NOOP to ASIC, ex: BZM_sendnoop 0xFA\n");
+    printf("  BZM_readreg <asic> <engine> <offset> <count>\n");
+    printf("                    Read BZM register bytes, ex: BZM_readreg 0xFA 0xFFF 0x0B 4\n");
+    printf("  BZM_writereg <asic> <engine> <offset> <byte...>\n");
+    printf("                    Write BZM register bytes, ex: BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00\n");
     printf("  pattern           Send default 9-bit test pattern on data UART\n");
     printf("  send9 <...>       Send one or more 9-bit words, ex: send9 0x155 0x0aa\n");
     printf("  raw <...>         Send raw byte stream on data UART, ex: raw 55 01 aa 00\n");
@@ -144,6 +163,8 @@ static esp_err_t init_interfaces(void)
 {
     ESP_ERROR_CHECK(uart_init_port(CONTROL_UART_PORT, CONTROL_UART_TX_PIN, CONTROL_UART_RX_PIN, CONTROL_UART_BAUDRATE, CONTROL_UART_BUF_SIZE));
     ESP_ERROR_CHECK(uart_init_port(DATA_UART_PORT, DATA_UART_TX_PIN, DATA_UART_RX_PIN, DATA_UART_BAUDRATE, DATA_UART_BUF_SIZE));
+    s_data_uart_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_data_uart_mutex != NULL, ESP_ERR_NO_MEM, TAG, "data uart mutex alloc failed");
     ESP_ERROR_CHECK(tps546_init());
     return ESP_OK;
 }
@@ -230,14 +251,13 @@ static esp_err_t control_send_command(uint8_t page, uint8_t command, const uint8
     }
 
     {
-        uint8_t framed[CONTROL_RESPONSE_MAX];
         size_t framed_len = response->len + 3;
 
-        framed[0] = header[0];
-        framed[1] = header[1];
-        framed[2] = header[2];
-        memcpy(&framed[3], response->payload, response->len);
-        hexdump_bytes("CTRL RX", framed, framed_len);
+        s_control_framed_response[0] = header[0];
+        s_control_framed_response[1] = header[1];
+        s_control_framed_response[2] = header[2];
+        memcpy(&s_control_framed_response[3], response->payload, response->len);
+        hexdump_bytes("CTRL RX", s_control_framed_response, framed_len);
     }
 
     return ESP_OK;
@@ -1001,9 +1021,15 @@ static void cmd_vr(char *args)
 
 static void data_send_bytes(const uint8_t *bytes, size_t len)
 {
+    if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        printf("data uart busy\n");
+        return;
+    }
+
     hexdump_bytes("DATA TX", bytes, len);
     uart_write_bytes(DATA_UART_PORT, bytes, len);
     ESP_ERROR_CHECK_WITHOUT_ABORT(uart_wait_tx_done(DATA_UART_PORT, pdMS_TO_TICKS(100)));
+    xSemaphoreGive(s_data_uart_mutex);
 }
 
 static void data_send_words(const uint16_t *words, size_t count)
@@ -1029,6 +1055,252 @@ static void cmd_pattern(void)
     data_send_words(pattern, sizeof(pattern) / sizeof(pattern[0]));
 }
 
+static void print_data_words(const char *prefix, const uint16_t *words, size_t count)
+{
+    printf("%s (%u words):", prefix, (unsigned)count);
+    for (size_t i = 0; i < count; i++) {
+        printf(" 0x%03X", words[i]);
+    }
+    printf("\n");
+}
+
+static esp_err_t data_write_words_locked(const uint16_t *words, size_t count)
+{
+    size_t encoded_len = 0;
+
+    if ((count * 2) > sizeof(s_data_encoded_buf)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        s_data_encoded_buf[encoded_len++] = (uint8_t)(words[i] & 0xff);
+        s_data_encoded_buf[encoded_len++] = (uint8_t)((words[i] >> 8) & 0x01);
+    }
+
+    hexdump_bytes("DATA TX", s_data_encoded_buf, encoded_len);
+    print_data_words("DATA TX9", words, count);
+
+    int written = uart_write_bytes(DATA_UART_PORT, s_data_encoded_buf, encoded_len);
+    if (written != (int)encoded_len) {
+        return ESP_FAIL;
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(uart_wait_tx_done(DATA_UART_PORT, pdMS_TO_TICKS(100)));
+    return ESP_OK;
+}
+
+static esp_err_t data_read_words_exact_locked(uint16_t *words, size_t count, uint32_t timeout_ms)
+{
+    if ((count * 2) > sizeof(s_data_encoded_buf)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ESP_RETURN_ON_ERROR(uart_read_exact(DATA_UART_PORT, s_data_encoded_buf, count * 2, timeout_ms), TAG, "data response timeout");
+    hexdump_bytes("DATA RX", s_data_encoded_buf, count * 2);
+
+    for (size_t i = 0; i < count; i++) {
+        words[i] = (uint16_t)s_data_encoded_buf[i * 2] | (((uint16_t)s_data_encoded_buf[i * 2 + 1] & 0x01) << 8);
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t data_read_words_available_locked(uint16_t *words, size_t max_words, size_t *actual_words, uint32_t idle_timeout_ms)
+{
+    size_t byte_count = 0;
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)idle_timeout_ms * 1000);
+
+    if ((max_words * 2) > sizeof(s_data_encoded_buf)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    while (byte_count < (max_words * 2)) {
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        int chunk;
+
+        if (remaining_us <= 0) {
+            break;
+        }
+
+        TickType_t timeout_ticks = pdMS_TO_TICKS((remaining_us + 999) / 1000);
+        if (timeout_ticks == 0) {
+            timeout_ticks = 1;
+        }
+
+        chunk = uart_read_bytes(DATA_UART_PORT, &s_data_encoded_buf[byte_count], (max_words * 2) - byte_count, timeout_ticks);
+        if (chunk < 0) {
+            return ESP_FAIL;
+        }
+
+        if (chunk == 0) {
+            break;
+        }
+
+        byte_count += (size_t)chunk;
+        deadline_us = esp_timer_get_time() + ((int64_t)idle_timeout_ms * 1000);
+    }
+
+    if ((byte_count % 2) != 0) {
+        printf("warning: odd response byte count %u, dropping last byte\n", (unsigned)byte_count);
+        byte_count--;
+    }
+
+    if (byte_count > 0) {
+        hexdump_bytes("DATA RX", s_data_encoded_buf, byte_count);
+    }
+
+    *actual_words = byte_count / 2;
+    for (size_t i = 0; i < *actual_words; i++) {
+        words[i] = (uint16_t)s_data_encoded_buf[i * 2] | (((uint16_t)s_data_encoded_buf[i * 2 + 1] & 0x01) << 8);
+    }
+
+    return ESP_OK;
+}
+
+static void cmd_bzm_sendnoop(char *args)
+{
+    uint32_t parsed[1];
+    size_t rx_count = 0;
+    esp_err_t err;
+
+    if (parse_hex_sequence(args, parsed, 1, 0xff) != 1) {
+        printf("usage: BZM_sendnoop <asic>\n");
+        return;
+    }
+
+    if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        printf("data uart busy\n");
+        return;
+    }
+
+    uart_flush_input(DATA_UART_PORT);
+    s_bzm_tx_words[0] = 0x0100 | (uint16_t)parsed[0];
+    s_bzm_tx_words[1] = 0x00F0;
+
+    err = data_write_words_locked(s_bzm_tx_words, 2);
+    if (err == ESP_OK) {
+        err = data_read_words_available_locked(s_bzm_rx_words, 8, &rx_count, 100);
+    }
+
+    xSemaphoreGive(s_data_uart_mutex);
+
+    if (err != ESP_OK) {
+        printf("BZM_sendnoop failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    if (rx_count == 0) {
+        printf("BZM_sendnoop: no response\n");
+        return;
+    }
+
+    print_data_words("BZM RX", s_bzm_rx_words, rx_count);
+}
+
+static void cmd_bzm_readreg(char *args)
+{
+    uint32_t parsed[4];
+    esp_err_t err;
+    size_t expected_words;
+
+    if (parse_hex_sequence(args, parsed, 4, 0xfff) != 4 ||
+        parsed[0] > 0xff || parsed[2] > 0xff || parsed[3] == 0 || parsed[3] > 0xff) {
+        printf("usage: BZM_readreg <asic> <engine_id> <offset> <count>\n");
+        return;
+    }
+
+    expected_words = (size_t)parsed[3] + 2;
+    if (expected_words > (sizeof(s_bzm_rx_words) / sizeof(s_bzm_rx_words[0]))) {
+        printf("count too large\n");
+        return;
+    }
+
+    if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        printf("data uart busy\n");
+        return;
+    }
+
+    uart_flush_input(DATA_UART_PORT);
+    s_bzm_tx_words[0] = 0x0100 | (uint16_t)parsed[0];
+    s_bzm_tx_words[1] = 0x0030 | (uint16_t)((parsed[1] & 0x0F00) >> 8);
+    s_bzm_tx_words[2] = (uint16_t)(parsed[1] & 0x00FF);
+    s_bzm_tx_words[3] = (uint16_t)parsed[2];
+    s_bzm_tx_words[4] = (uint16_t)(parsed[3] - 1);
+    s_bzm_tx_words[5] = 0x0000;
+
+    err = data_write_words_locked(s_bzm_tx_words, 6);
+    if (err == ESP_OK) {
+        err = data_read_words_exact_locked(s_bzm_rx_words, expected_words, 500);
+    }
+
+    xSemaphoreGive(s_data_uart_mutex);
+
+    if (err != ESP_OK) {
+        printf("BZM_readreg failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    print_data_words("BZM RX", s_bzm_rx_words, expected_words);
+}
+
+static void cmd_bzm_writereg(char *args)
+{
+    size_t parsed_count;
+    size_t tx_count;
+    size_t rx_count = 0;
+    esp_err_t err;
+
+    parsed_count = parse_hex_sequence(args, s_bzm_parsed, BZM_MAX_WRITE_ARGS, 0xfff);
+    if (parsed_count < 4 || s_bzm_parsed[0] > 0xff || s_bzm_parsed[2] > 0xff) {
+        printf("usage: BZM_writereg <asic> <engine_id> <offset> <byte...>\n");
+        return;
+    }
+
+    for (size_t i = 3; i < parsed_count; i++) {
+        if (s_bzm_parsed[i] > 0xff) {
+            printf("write bytes must be 0x00-0xFF\n");
+            return;
+        }
+    }
+
+    s_bzm_tx_words[0] = 0x0100 | (uint16_t)s_bzm_parsed[0];
+    s_bzm_tx_words[1] = 0x0020 | (uint16_t)((s_bzm_parsed[1] & 0x0F00) >> 8);
+    s_bzm_tx_words[2] = (uint16_t)(s_bzm_parsed[1] & 0x00FF);
+    s_bzm_tx_words[3] = (uint16_t)s_bzm_parsed[2];
+    s_bzm_tx_words[4] = (uint16_t)((parsed_count - 3) - 1);
+    tx_count = 5;
+
+    for (size_t i = 3; i < parsed_count; i++) {
+        s_bzm_tx_words[tx_count++] = (uint16_t)s_bzm_parsed[i];
+    }
+    s_bzm_tx_words[tx_count++] = 0x0000;
+
+    if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        printf("data uart busy\n");
+        return;
+    }
+
+    uart_flush_input(DATA_UART_PORT);
+    err = data_write_words_locked(s_bzm_tx_words, tx_count);
+    if (err == ESP_OK) {
+        err = data_read_words_available_locked(s_bzm_rx_words, 32, &rx_count, 50);
+    }
+
+    xSemaphoreGive(s_data_uart_mutex);
+
+    if (err != ESP_OK) {
+        printf("BZM_writereg failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    if (rx_count == 0) {
+        printf("BZM_writereg sent\n");
+        return;
+    }
+
+    print_data_words("BZM RX", s_bzm_rx_words, rx_count);
+}
+
 static size_t parse_hex_sequence(char *args, uint32_t *values, size_t max_values, uint32_t max_allowed)
 {
     size_t count = 0;
@@ -1052,10 +1324,24 @@ static size_t parse_hex_sequence(char *args, uint32_t *values, size_t max_values
 static void data_rx_task(void *arg)
 {
     uint8_t buf[256];
+    size_t buffered_len = 0;
     (void)arg;
 
     while (true) {
-        int len = uart_read_bytes(DATA_UART_PORT, buf, sizeof(buf), pdMS_TO_TICKS(200));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(uart_get_buffered_data_len(DATA_UART_PORT, &buffered_len));
+        if (buffered_len == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        int len = uart_read_bytes(DATA_UART_PORT, buf, sizeof(buf), 0);
+        xSemaphoreGive(s_data_uart_mutex);
+
         if (len > 0) {
             hexdump_bytes("DATA RX", buf, (size_t)len);
 
@@ -1142,14 +1428,25 @@ void app_main(void)
         } else if (strcmp(line, "pattern") == 0) {
             cmd_pattern();
         } else if (strcmp(line, "flush") == 0) {
-            uart_flush_input(DATA_UART_PORT);
-            printf("data uart rx flushed\n");
+            if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                uart_flush_input(DATA_UART_PORT);
+                xSemaphoreGive(s_data_uart_mutex);
+                printf("data uart rx flushed\n");
+            } else {
+                printf("data uart busy\n");
+            }
         } else if (strncmp(line, "5v ", 3) == 0) {
             cmd_set_5v(atoi(&line[3]));
         } else if (strncmp(line, "rst ", 4) == 0) {
             cmd_set_rst(atoi(&line[4]));
         } else if (strncmp(line, "fan ", 4) == 0) {
             cmd_set_fan(atoi(&line[4]));
+        } else if (strncmp(line, "BZM_sendnoop ", 13) == 0) {
+            cmd_bzm_sendnoop(&line[13]);
+        } else if (strncmp(line, "BZM_readreg ", 12) == 0) {
+            cmd_bzm_readreg(&line[12]);
+        } else if (strncmp(line, "BZM_writereg ", 13) == 0) {
+            cmd_bzm_writereg(&line[13]);
         } else if (strncmp(line, "send9 ", 6) == 0) {
             uint32_t parsed[32];
             uint16_t words[32];

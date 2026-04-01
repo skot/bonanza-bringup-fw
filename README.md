@@ -71,6 +71,9 @@ Type commands into the ESP-IDF monitor:
 - `vr bringup`
 - `vr pin 1`
 - `vr op 1`
+- `BZM_sendnoop 0xFA`
+- `BZM_readreg 0xFA 0xFFF 0x0B 4`
+- `BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00`
 - `pattern`
 - `send9 0x155 0x0aa 0x1ff`
 - `raw 55 01 aa 00`
@@ -92,3 +95,19 @@ The `vr` commands are intended for staged regulator bring-up:
 - `vr op <0|1>` writes the PMBus `OPERATION` register
 
 The harness does not auto-enable the regulator at boot. `GPIO10` is driven low during initialization so regulator bring-up stays explicit.
+
+## ASIC Commands
+
+The harness also includes direct BZM2 command helpers on the data UART, matching the Python bring-up scripts:
+
+- `BZM_sendnoop <asic>`
+- `BZM_readreg <asic> <engine_id> <offset> <count>`
+- `BZM_writereg <asic> <engine_id> <offset> <byte...>`
+
+Examples:
+
+- `BZM_sendnoop 0xFA`
+- `BZM_readreg 0xFA 0xFFF 0x0B 4`
+- `BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00`
+
+These commands send the same 9-bit word sequences as the Python `bzm2.py` helpers and print the returned 9-bit words from the ASIC path.
