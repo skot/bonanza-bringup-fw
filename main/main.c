@@ -44,6 +44,11 @@
 #define BZM_MAX_WRITE_ARGS 68
 #define BZM_MAX_WRITE_WORDS 80
 #define BZM_MAX_READ_WORDS 258
+#define BZM_BROADCAST_ASIC_ID 0xFA
+#define BZM_BROADCAST_ENGINE_ID 0xFFF
+#define BZM_REG_ASIC_ID 0x0B
+#define BZM_ADDRESS_BASE 0x42
+#define BZM_ADDRESS_CHIP_COUNT 4
 
 #define CONTROL_PAGE_GPIO 0x06
 #define CONTROL_PAGE_FAN 0x09
@@ -71,6 +76,9 @@ static uint16_t s_bzm_rx_words[BZM_MAX_READ_WORDS];
 static uint32_t s_bzm_parsed[BZM_MAX_WRITE_ARGS];
 
 static size_t parse_hex_sequence(char *args, uint32_t *values, size_t max_values, uint32_t max_allowed);
+static esp_err_t data_write_words_locked(const uint16_t *words, size_t count);
+static esp_err_t data_read_words_exact_locked(uint16_t *words, size_t count, uint32_t timeout_ms);
+static esp_err_t data_read_words_available_locked(uint16_t *words, size_t max_words, size_t *actual_words, uint32_t idle_timeout_ms);
 
 static void hexdump_bytes(const char *prefix, const uint8_t *data, size_t len)
 {
@@ -111,6 +119,8 @@ static void print_help(void)
     printf("                    Read BZM register bytes, ex: BZM_readreg 0xFA 0xFFF 0x0B 4\n");
     printf("  BZM_writereg <asic> <engine> <offset> <byte...>\n");
     printf("                    Write BZM register bytes, ex: BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00\n");
+    printf("  BZM_addr4         Reset and address up to four ASICs as 0x42..0x45\n");
+    printf("  BZM_probeall      Probe ASIC IDs 0x42..0x45 with NOOP and report responders\n");
     printf("  pattern           Send default 9-bit test pattern on data UART\n");
     printf("  send9 <...>       Send one or more 9-bit words, ex: send9 0x155 0x0aa\n");
     printf("  raw <...>         Send raw byte stream on data UART, ex: raw 55 01 aa 00\n");
@@ -1055,6 +1065,82 @@ static void cmd_pattern(void)
     data_send_words(pattern, sizeof(pattern) / sizeof(pattern[0]));
 }
 
+static esp_err_t bzm_sendnoop_locked(uint8_t asic, size_t *rx_count, uint32_t idle_timeout_ms)
+{
+    s_bzm_tx_words[0] = 0x0100 | (uint16_t)asic;
+    s_bzm_tx_words[1] = 0x00F0;
+
+    ESP_RETURN_ON_ERROR(data_write_words_locked(s_bzm_tx_words, 2), TAG, "noop write failed");
+    ESP_RETURN_ON_ERROR(data_read_words_available_locked(s_bzm_rx_words, 8, rx_count, idle_timeout_ms), TAG, "noop read failed");
+    return ESP_OK;
+}
+
+static esp_err_t bzm_readreg_locked(uint8_t asic, uint16_t engine_id, uint8_t offset, uint8_t count, size_t *actual_words, uint32_t timeout_ms)
+{
+    size_t expected_words = (size_t)count + 2;
+
+    if (expected_words > (sizeof(s_bzm_rx_words) / sizeof(s_bzm_rx_words[0]))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    s_bzm_tx_words[0] = 0x0100 | (uint16_t)asic;
+    s_bzm_tx_words[1] = 0x0030 | (uint16_t)((engine_id & 0x0F00) >> 8);
+    s_bzm_tx_words[2] = (uint16_t)(engine_id & 0x00FF);
+    s_bzm_tx_words[3] = (uint16_t)offset;
+    s_bzm_tx_words[4] = (uint16_t)(count - 1);
+    s_bzm_tx_words[5] = 0x0000;
+
+    ESP_RETURN_ON_ERROR(data_write_words_locked(s_bzm_tx_words, 6), TAG, "readreg write failed");
+    ESP_RETURN_ON_ERROR(data_read_words_exact_locked(s_bzm_rx_words, expected_words, timeout_ms), TAG, "readreg response failed");
+    *actual_words = expected_words;
+    return ESP_OK;
+}
+
+static esp_err_t bzm_writereg_locked(uint8_t asic, uint16_t engine_id, uint8_t offset, const uint8_t *write_data, size_t count)
+{
+    size_t tx_count = 5;
+
+    if ((count + 6) > (sizeof(s_bzm_tx_words) / sizeof(s_bzm_tx_words[0]))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    s_bzm_tx_words[0] = 0x0100 | (uint16_t)asic;
+    s_bzm_tx_words[1] = 0x0020 | (uint16_t)((engine_id & 0x0F00) >> 8);
+    s_bzm_tx_words[2] = (uint16_t)(engine_id & 0x00FF);
+    s_bzm_tx_words[3] = (uint16_t)offset;
+    s_bzm_tx_words[4] = (uint16_t)(count - 1);
+
+    for (size_t i = 0; i < count; i++) {
+        s_bzm_tx_words[tx_count++] = (uint16_t)write_data[i];
+    }
+    s_bzm_tx_words[tx_count++] = 0x0000;
+
+    ESP_RETURN_ON_ERROR(data_write_words_locked(s_bzm_tx_words, tx_count), TAG, "writereg failed");
+    return ESP_OK;
+}
+
+static bool bzm_parse_asic_id_readback(size_t word_count, uint8_t expected_id, uint8_t *reported_id, bool *chain_enabled)
+{
+    if (word_count < 4) {
+        return false;
+    }
+
+    *reported_id = (uint8_t)(s_bzm_rx_words[2] & 0x00FF);
+    *chain_enabled = (s_bzm_rx_words[3] & 0x0001) != 0;
+    return *reported_id == expected_id;
+}
+
+static esp_err_t bzm_pulse_reset(void)
+{
+    uint8_t echoed = 0;
+
+    ESP_RETURN_ON_ERROR(control_set_byte(CONTROL_PAGE_GPIO, GPIO_CMD_ASIC_RST, 0, &echoed), TAG, "failed to drive asic_rst low");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_RETURN_ON_ERROR(control_set_byte(CONTROL_PAGE_GPIO, GPIO_CMD_ASIC_RST, 1, &echoed), TAG, "failed to drive asic_rst high");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    return ESP_OK;
+}
+
 static void print_data_words(const char *prefix, const uint16_t *words, size_t count)
 {
     printf("%s (%u words):", prefix, (unsigned)count);
@@ -1301,6 +1387,166 @@ static void cmd_bzm_writereg(char *args)
     print_data_words("BZM RX", s_bzm_rx_words, rx_count);
 }
 
+static void cmd_bzm_addr4(void)
+{
+    uint8_t v5_en = 0;
+    esp_err_t err;
+    size_t addressed = 0;
+    bool stopped_on_failure = false;
+
+    printf("BZM 4-chip address sequence\n");
+    printf("expected IDs: 0x%02X 0x%02X 0x%02X 0x%02X\n",
+           BZM_ADDRESS_BASE,
+           BZM_ADDRESS_BASE + 1,
+           BZM_ADDRESS_BASE + 2,
+           BZM_ADDRESS_BASE + 3);
+
+    if (control_get_byte(CONTROL_PAGE_GPIO, GPIO_CMD_5V_EN, &v5_en) == ESP_OK && v5_en == 0) {
+        printf("warning: 5v_en is low; run `5v 1` first if the ASIC rail is not powered\n");
+    }
+
+    if (!tps546_get_pgood_pin()) {
+        printf("warning: VR PGOOD is low; run `vr bringup` if core voltage is not enabled\n");
+    }
+
+    err = bzm_pulse_reset();
+    if (err != ESP_OK) {
+        printf("BZM_addr4 failed during ASIC reset: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("ASIC reset pulsed; waiting for chain to settle...\n");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        printf("data uart busy\n");
+        return;
+    }
+
+    uart_flush_input(DATA_UART_PORT);
+
+    for (size_t i = 0; i < BZM_ADDRESS_CHIP_COUNT; i++) {
+        uint8_t target_id = (uint8_t)(BZM_ADDRESS_BASE + i);
+        uint8_t id_write[4] = {target_id, (uint8_t)(i == 0 ? 0x00 : 0x01), 0x00, 0x00};
+        size_t rx_count = 0;
+        uint8_t reported_id = 0;
+        bool chain_enabled = false;
+        bool readback_ok = false;
+        bool noop_ok = false;
+
+        printf("\n[chip %u] probe unaddressed ASIC at 0x%02X\n", (unsigned)(i + 1), BZM_BROADCAST_ASIC_ID);
+        err = bzm_sendnoop_locked(BZM_BROADCAST_ASIC_ID, &rx_count, 150);
+        if (err != ESP_OK) {
+            printf("  probe failed: %s\n", esp_err_to_name(err));
+            stopped_on_failure = true;
+            break;
+        }
+        if (rx_count == 0) {
+            printf("  no unaddressed ASIC responded; stopping after %u addressed chip(s)\n", (unsigned)addressed);
+            break;
+        }
+        printf("  unaddressed response ok (%u words)\n", (unsigned)rx_count);
+        print_data_words("  broadcast RX", s_bzm_rx_words, rx_count);
+
+        printf("  program ASIC_ID -> 0x%02X\n", target_id);
+        err = bzm_writereg_locked(BZM_BROADCAST_ASIC_ID, BZM_BROADCAST_ENGINE_ID, BZM_REG_ASIC_ID, id_write, sizeof(id_write));
+        if (err != ESP_OK) {
+            printf("  write failed: %s\n", esp_err_to_name(err));
+            stopped_on_failure = true;
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        printf("  read back ASIC_ID from 0x%02X\n", target_id);
+        err = bzm_readreg_locked(target_id, BZM_BROADCAST_ENGINE_ID, BZM_REG_ASIC_ID, 4, &rx_count, 500);
+        if (err == ESP_OK) {
+            readback_ok = bzm_parse_asic_id_readback(rx_count, target_id, &reported_id, &chain_enabled);
+            print_data_words("  readback RX", s_bzm_rx_words, rx_count);
+            printf("  readback ASIC_ID=0x%02X chain_enable=%u %s\n",
+                   reported_id,
+                   chain_enabled ? 1 : 0,
+                   readback_ok ? "OK" : "MISMATCH");
+        } else {
+            printf("  readback failed: %s\n", esp_err_to_name(err));
+        }
+
+        printf("  verify NOOP on 0x%02X\n", target_id);
+        err = bzm_sendnoop_locked(target_id, &rx_count, 150);
+        if (err == ESP_OK && rx_count > 0) {
+            noop_ok = true;
+            printf("  addressed response ok (%u words)\n", (unsigned)rx_count);
+            print_data_words("  addressed RX", s_bzm_rx_words, rx_count);
+        } else if (err == ESP_OK) {
+            printf("  no NOOP response from 0x%02X\n", target_id);
+        } else {
+            printf("  NOOP verify failed: %s\n", esp_err_to_name(err));
+        }
+
+        if (!readback_ok || !noop_ok) {
+            printf("  chip %u did not verify cleanly; stopping with chain state uncertain\n", (unsigned)(i + 1));
+            stopped_on_failure = true;
+            break;
+        }
+
+        addressed++;
+        printf("  chip %u assigned to 0x%02X successfully\n", (unsigned)(i + 1), target_id);
+    }
+
+    xSemaphoreGive(s_data_uart_mutex);
+
+    printf("\nBZM_addr4 summary:\n");
+    printf("  addressed chips: %u/%u\n", (unsigned)addressed, BZM_ADDRESS_CHIP_COUNT);
+    if (stopped_on_failure) {
+        printf("  result: stopped on verification failure\n");
+    } else if (addressed == BZM_ADDRESS_CHIP_COUNT) {
+        printf("  result: all four chips addressed\n");
+    } else {
+        printf("  result: chain ended early with fewer than four responding chips\n");
+    }
+}
+
+static void cmd_bzm_probeall(void)
+{
+    size_t responders = 0;
+
+    printf("BZM probe all addressed chips\n");
+
+    if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        printf("data uart busy\n");
+        return;
+    }
+
+    uart_flush_input(DATA_UART_PORT);
+
+    for (size_t i = 0; i < BZM_ADDRESS_CHIP_COUNT; i++) {
+        uint8_t asic_id = (uint8_t)(BZM_ADDRESS_BASE + i);
+        size_t rx_count = 0;
+        esp_err_t err = bzm_sendnoop_locked(asic_id, &rx_count, 150);
+
+        printf("\n[chip %u] NOOP 0x%02X\n", (unsigned)(i + 1), asic_id);
+
+        if (err != ESP_OK) {
+            printf("  probe failed: %s\n", esp_err_to_name(err));
+            continue;
+        }
+
+        if (rx_count == 0) {
+            printf("  no response\n");
+            continue;
+        }
+
+        responders++;
+        printf("  response ok (%u words)\n", (unsigned)rx_count);
+        print_data_words("  RX", s_bzm_rx_words, rx_count);
+    }
+
+    xSemaphoreGive(s_data_uart_mutex);
+
+    printf("\nBZM_probeall summary:\n");
+    printf("  responders: %u/%u\n", (unsigned)responders, BZM_ADDRESS_CHIP_COUNT);
+}
+
 static size_t parse_hex_sequence(char *args, uint32_t *values, size_t max_values, uint32_t max_allowed)
 {
     size_t count = 0;
@@ -1447,6 +1693,10 @@ void app_main(void)
             cmd_bzm_readreg(&line[12]);
         } else if (strncmp(line, "BZM_writereg ", 13) == 0) {
             cmd_bzm_writereg(&line[13]);
+        } else if (strcmp(line, "BZM_addr4") == 0) {
+            cmd_bzm_addr4();
+        } else if (strcmp(line, "BZM_probeall") == 0) {
+            cmd_bzm_probeall();
         } else if (strncmp(line, "send9 ", 6) == 0) {
             uint32_t parsed[32];
             uint16_t words[32];

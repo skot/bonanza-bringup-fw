@@ -74,6 +74,8 @@ Type commands into the ESP-IDF monitor:
 - `BZM_sendnoop 0xFA`
 - `BZM_readreg 0xFA 0xFFF 0x0B 4`
 - `BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00`
+- `BZM_addr4`
+- `BZM_probeall`
 - `pattern`
 - `send9 0x155 0x0aa 0x1ff`
 - `raw 55 01 aa 00`
@@ -103,11 +105,27 @@ The harness also includes direct BZM2 command helpers on the data UART, matching
 - `BZM_sendnoop <asic>`
 - `BZM_readreg <asic> <engine_id> <offset> <count>`
 - `BZM_writereg <asic> <engine_id> <offset> <byte...>`
+- `BZM_addr4`
+- `BZM_probeall`
 
 Examples:
 
 - `BZM_sendnoop 0xFA`
 - `BZM_readreg 0xFA 0xFFF 0x0B 4`
 - `BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00`
+- `BZM_addr4`
+- `BZM_probeall`
 
 These commands send the same 9-bit word sequences as the Python `bzm2.py` helpers and print the returned 9-bit words from the ASIC path.
+
+`BZM_addr4` is a board bring-up helper that follows the Python `asic_comm.py` sequence for up to four chips:
+
+- pulse ASIC reset through the RP2040 control UART
+- probe for an unaddressed ASIC at `0xFA`
+- program IDs `0x42`, `0x43`, `0x44`, and `0x45` one at a time
+- read back register `0x0B` (`ASIC_ID`) after each write
+- verify each newly assigned ID with a `NOOP`
+
+It stops on the first ambiguous step and prints a summary, so if only some chips are alive you can still see how far the chain got.
+
+`BZM_probeall` is a non-destructive follow-up that sends `NOOP` to `0x42`, `0x43`, `0x44`, and `0x45` and reports which addressed chips are responding.
