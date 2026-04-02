@@ -205,6 +205,7 @@ The harness also includes direct BZM2 command helpers on the data UART, matching
 - `BZM_sendnoop <asic>`
 - `BZM_readreg <asic> <engine_id> <offset> <count>`
 - `BZM_writereg <asic> <engine_id> <offset> <byte...>`
+- `BZM_temp <asic> [thermal_div]`
 - `BZM_addr4`
 - `BZM_probeall`
 
@@ -213,10 +214,13 @@ Examples:
 - `BZM_sendnoop 0xFA`
 - `BZM_readreg 0xFA 0xFFF 0x0B 4`
 - `BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00`
+- `BZM_temp 0x42`
 - `BZM_addr4`
 - `BZM_probeall`
 
 These commands send the same 9-bit word sequences as the Python `bzm2.py` helpers and print the returned 9-bit words from the ASIC path.
+
+`BZM_temp` temporarily enables the on-die thermal sensor described in datasheet section 9, waits for the SAR conversion, reads register `0x32`, converts the returned temp code to Celsius, and restores the previous sensor configuration. On Bonanza, the optional `thermal_div` defaults to `0x08`, which matches the confirmed `50 MHz` ASIC reference clock.
 
 `BZM_addr4` is a board bring-up helper that follows the Python `asic_comm.py` sequence for up to four chips:
 

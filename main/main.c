@@ -47,9 +47,16 @@
 #define BZM_MAX_READ_WORDS 258
 #define BZM_BROADCAST_ASIC_ID 0xFA
 #define BZM_BROADCAST_ENGINE_ID 0xFFF
+#define BZM_REG_DTS_SRST_PD 0x2E
+#define BZM_REG_TEMPSENSOR_TUNECODE 0x30
+#define BZM_REG_TEMPSENSOR_TRIP_STATUS 0x31
+#define BZM_REG_TEMPSENSOR_TEMP_CODE_STATUS 0x32
+#define BZM_REG_SENSOR_CLK_DIV 0x3D
 #define BZM_REG_ASIC_ID 0x0B
 #define BZM_ADDRESS_BASE 0x42
 #define BZM_ADDRESS_CHIP_COUNT 4
+#define BZM_DEFAULT_THERMAL_SENSOR_DIV 8
+#define BZM_TEMP_SAMPLE_DELAY_MS 10
 
 #define CONTROL_PAGE_GPIO 0x06
 #define CONTROL_PAGE_FAN 0x09
@@ -129,6 +136,8 @@ static void print_help(void)
     printf("                    Read BZM register bytes, ex: BZM_readreg 0xFA 0xFFF 0x0B 4\n");
     printf("  BZM_writereg <asic> <engine> <offset> <byte...>\n");
     printf("                    Write BZM register bytes, ex: BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00\n");
+    printf("  BZM_temp <asic> [thermal_div]\n");
+    printf("                    Read ASIC temperature, Bonanza default is 0x08 for 50 MHz, ex: BZM_temp 0x42\n");
     printf("  BZM_addr4         Reset and address up to four ASICs as 0x42..0x45\n");
     printf("  BZM_probeall      Probe ASIC IDs 0x42..0x45 with NOOP and report responders\n");
     printf("  pattern           Send default 9-bit test pattern on data UART\n");
@@ -1316,6 +1325,45 @@ static esp_err_t bzm_writereg_locked(uint8_t asic, uint16_t engine_id, uint8_t o
     return ESP_OK;
 }
 
+static esp_err_t bzm_read_u32_reg_locked(uint8_t asic, uint16_t engine_id, uint8_t offset, uint32_t *value, uint32_t timeout_ms)
+{
+    size_t word_count = 0;
+
+    ESP_RETURN_ON_ERROR(bzm_readreg_locked(asic, engine_id, offset, 4, &word_count, timeout_ms), TAG, "read u32 reg failed");
+    if (word_count < 6) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    *value = ((uint32_t)(s_bzm_rx_words[2] & 0x00FFu)) |
+             ((uint32_t)(s_bzm_rx_words[3] & 0x00FFu) << 8) |
+             ((uint32_t)(s_bzm_rx_words[4] & 0x00FFu) << 16) |
+             ((uint32_t)(s_bzm_rx_words[5] & 0x00FFu) << 24);
+    return ESP_OK;
+}
+
+static esp_err_t bzm_write_u32_reg_locked(uint8_t asic, uint16_t engine_id, uint8_t offset, uint32_t value)
+{
+    uint8_t write_data[4] = {
+        (uint8_t)(value & 0xFFu),
+        (uint8_t)((value >> 8) & 0xFFu),
+        (uint8_t)((value >> 16) & 0xFFu),
+        (uint8_t)((value >> 24) & 0xFFu),
+    };
+
+    return bzm_writereg_locked(asic, engine_id, offset, write_data, sizeof(write_data));
+}
+
+static bool bzm_is_valid_sensor_div(uint32_t divider)
+{
+    return divider >= 2 && divider <= 16;
+}
+
+static float bzm_temp_code_to_celsius(uint16_t code)
+{
+    // Match Intel's Blockscale reference SDK: 12-bit TS Conversion mode.
+    return -293.8f + (631.8f * (((float)code) - 0.5f) / 4096.0f);
+}
+
 static bool bzm_parse_asic_id_readback(size_t word_count, uint8_t expected_id, uint8_t *reported_id, bool *chain_enabled)
 {
     if (word_count < 4) {
@@ -1582,6 +1630,168 @@ static void cmd_bzm_writereg(char *args)
     }
 
     print_data_words("BZM RX", s_bzm_rx_words, rx_count);
+}
+
+static void cmd_bzm_temp(char *args)
+{
+    uint32_t parsed[2];
+    size_t parsed_count;
+    uint8_t asic;
+    uint8_t thermal_div = BZM_DEFAULT_THERMAL_SENSOR_DIV;
+    uint32_t original_clk_div = 0;
+    uint32_t original_dts_srst_pd = 0;
+    uint32_t original_temp_cfg = 0;
+    uint32_t configured_clk_div = 0;
+    uint32_t configured_dts_srst_pd = 0;
+    uint32_t configured_temp_cfg = 0;
+    uint32_t temp_status = 0;
+    uint32_t trip_status = 0;
+    esp_err_t err = ESP_OK;
+    esp_err_t restore_err = ESP_OK;
+    bool clk_div_changed = false;
+    bool dts_srst_pd_changed = false;
+    bool temp_cfg_changed = false;
+
+    parsed_count = parse_hex_sequence(args, parsed, 2, 0xfff);
+    if (parsed_count < 1 || parsed_count > 2 || parsed[0] > 0xff) {
+        printf("usage: BZM_temp <asic> [thermal_div]\n");
+        return;
+    }
+
+    if (parsed_count == 2) {
+        if (!bzm_is_valid_sensor_div(parsed[1])) {
+            printf("thermal_div must be between 0x02 and 0x10\n");
+            return;
+        }
+        thermal_div = (uint8_t)parsed[1];
+    }
+
+    asic = (uint8_t)parsed[0];
+
+    if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        printf("data uart busy\n");
+        return;
+    }
+
+    uart_flush_input(DATA_UART_PORT);
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_SENSOR_CLK_DIV, &original_clk_div, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_DTS_SRST_PD, &original_dts_srst_pd, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_TEMPSENSOR_TUNECODE, &original_temp_cfg, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    configured_clk_div = (original_clk_div & ~(0x1Fu << 5)) | ((uint32_t)thermal_div << 5);
+    configured_dts_srst_pd = (original_dts_srst_pd | (1u << 8)) & ~1u;
+    configured_temp_cfg = original_temp_cfg | 0x1u;
+
+    if (configured_clk_div != original_clk_div) {
+        err = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_SENSOR_CLK_DIV, configured_clk_div);
+        if (err != ESP_OK) {
+            goto out;
+        }
+        clk_div_changed = true;
+    }
+
+    if (configured_dts_srst_pd != original_dts_srst_pd) {
+        err = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_DTS_SRST_PD, configured_dts_srst_pd);
+        if (err != ESP_OK) {
+            goto out;
+        }
+        dts_srst_pd_changed = true;
+    }
+
+    if (configured_temp_cfg != original_temp_cfg) {
+        err = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_TEMPSENSOR_TUNECODE, configured_temp_cfg);
+        if (err != ESP_OK) {
+            goto out;
+        }
+        temp_cfg_changed = true;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(BZM_TEMP_SAMPLE_DELAY_MS));
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_TEMPSENSOR_TEMP_CODE_STATUS, &temp_status, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_TEMPSENSOR_TRIP_STATUS, &trip_status, 500);
+
+out:
+    if (temp_cfg_changed) {
+        esp_err_t tmp = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_TEMPSENSOR_TUNECODE, original_temp_cfg);
+        if (restore_err == ESP_OK && tmp != ESP_OK) {
+            restore_err = tmp;
+        }
+    }
+
+    if (dts_srst_pd_changed) {
+        esp_err_t tmp = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_DTS_SRST_PD, original_dts_srst_pd);
+        if (restore_err == ESP_OK && tmp != ESP_OK) {
+            restore_err = tmp;
+        }
+    }
+
+    if (clk_div_changed) {
+        esp_err_t tmp = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_SENSOR_CLK_DIV, original_clk_div);
+        if (restore_err == ESP_OK && tmp != ESP_OK) {
+            restore_err = tmp;
+        }
+    }
+
+    xSemaphoreGive(s_data_uart_mutex);
+
+    if (err != ESP_OK) {
+        printf("BZM_temp failed: %s\n", esp_err_to_name(err));
+        if (restore_err != ESP_OK) {
+            printf("warning: failed to restore sensor config: %s\n", esp_err_to_name(restore_err));
+        }
+        return;
+    }
+
+    {
+        uint16_t temp_code12 = (uint16_t)(temp_status & 0x0FFFu);
+        uint16_t trip_code = (uint16_t)((configured_temp_cfg >> 1) & 0x0FFFu);
+        bool sensor_fault = (temp_status & (1u << 12)) != 0;
+        bool trip_asserted = (trip_status & 0x1u) != 0;
+        float temp_c = bzm_temp_code_to_celsius(temp_code12);
+        bool threshold_was_zero = ((original_temp_cfg >> 1) & 0x0FFFu) == 0;
+
+        printf("BZM_temp ASIC 0x%02X\n", asic);
+        printf("  thermal_div=0x%02X", thermal_div);
+        if (parsed_count == 1) {
+            printf(" (Bonanza default for 50 MHz ref clock)");
+        }
+        printf("\n");
+        printf("  DTS_SRST_PD:      0x%08" PRIX32 " -> 0x%08" PRIX32 "\n", original_dts_srst_pd, configured_dts_srst_pd);
+        printf("  SENSOR_CLK_DIV:   0x%08" PRIX32 " -> 0x%08" PRIX32 "\n", original_clk_div, configured_clk_div);
+        printf("  TEMPSENSOR_CFG:   0x%08" PRIX32 " -> 0x%08" PRIX32 "\n", original_temp_cfg, configured_temp_cfg);
+        printf("  TEMP_STATUS:      0x%08" PRIX32 "\n", temp_status);
+        printf("  TEMP_CODE_12B:    %u (0x%03X)\n", temp_code12, temp_code12);
+        printf("  TRIP_CODE_12B:    %u (0x%03X)\n", trip_code, trip_code);
+        printf("  TEMPERATURE_C:    %.2f (Intel SDK 12-bit conversion)\n", temp_c);
+        printf("  SENSOR_FAULT:     %u\n", sensor_fault ? 1 : 0);
+        printf("  THERMAL_TRIP:     %u\n", trip_asserted ? 1 : 0);
+        if (restore_err != ESP_OK) {
+            printf("  restore_warning:  %s\n", esp_err_to_name(restore_err));
+        }
+        if (threshold_was_zero) {
+            printf("  note: original trip threshold was zero, so THERMAL_TRIP is not meaningful yet\n");
+        }
+        if (parsed_count == 1) {
+            printf("  note: Bonanza uses 50 MHz, so the default divider 0x08 should be correct\n");
+        }
+    }
 }
 
 static void cmd_bzm_addr4(void)
@@ -1904,6 +2114,10 @@ void app_main(void)
             cmd_bzm_readreg(&line[12]);
         } else if (strncmp(line, "BZM_writereg ", 13) == 0) {
             cmd_bzm_writereg(&line[13]);
+        } else if (strcmp(line, "BZM_temp") == 0) {
+            cmd_bzm_temp(&line[8]);
+        } else if (strncmp(line, "BZM_temp ", 9) == 0) {
+            cmd_bzm_temp(&line[9]);
         } else if (strcmp(line, "BZM_addr4") == 0) {
             cmd_bzm_addr4();
         } else if (strcmp(line, "BZM_probeall") == 0) {
