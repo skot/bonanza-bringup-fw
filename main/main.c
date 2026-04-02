@@ -194,7 +194,7 @@ static esp_err_t init_interfaces(void)
 static void cmd_rpflash_info(void)
 {
     printf("embedded rp2040 firmware:\n");
-    printf("  target repo: /Users/skot/Bitcoin/bitaxe-raw/bitaxe-raw-bonanza\n");
+    printf("  source:      compile-time embedded image\n");
     printf("  targetsel core0:  0x%08" PRIX32 "\n", (uint32_t)RP2040_TARGETSEL_CORE0);
     printf("  targetsel core1:  0x%08" PRIX32 "\n", (uint32_t)RP2040_TARGETSEL_CORE1);
     printf("  targetsel rescue: 0x%08" PRIX32 "\n", (uint32_t)RP2040_TARGETSEL_RESCUE);

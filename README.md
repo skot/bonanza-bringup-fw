@@ -1,6 +1,21 @@
 # bonanza-test
 
-Small ESP-IDF test firmware for validating the `bitaxe-raw-bonanza` RP2040 firmware on a bitaxeBonanza board and for bringing up the onboard TPS546D24S regulator from the ESP32-S3 side.
+`bonanza-test` is an ESP-IDF bring-up and factory-test firmware for the bitaxeBonanza board. It runs on the ESP32-S3 and acts as a board-side utility for:
+
+- validating an embedded RP2040 firmware image over the control and data UARTs
+- bringing up and testing the onboard TPS546D24S voltage regulator
+- sending low-level BZM2 commands to the ASIC chain and helping address up to four chips
+- talking to the RP2040 over SWD and flashing a compile-time embedded RP2040 firmware image
+
+In practice, this project is meant to be a single Bonanza board bring-up tool rather than just a UART test harness.
+
+## Features
+
+- RP2040 control-UART testing for GPIO, reset, 5V enable, and fan control
+- RP2040 data-UART testing for Bonanza 9-bit transport validation
+- TPS546D24S PMBus configuration, telemetry, status, and bring-up commands
+- BZM2 raw register access, `NOOP`, chain addressing, and chip probing helpers
+- ESP32-driven RP2040 SWD attach, halt, memory read/write, and in-system reflashing
 
 It uses two ESP32-S3 UARTs:
 
@@ -34,12 +49,56 @@ Baudrates:
 
 ## Build
 
+`bonanza-test` embeds an RP2040 firmware image at build time. You can provide that image in either of these ways:
+
+1. Use a prebuilt RP2040 `.bin`
+2. Point the build at an RP2040 Cargo repo and let `bonanza-test` build it
+
+### Option 1: Embed A Prebuilt `.bin`
+
 ```sh
 cd /Users/skot/Bitcoin/ESP-Miner/bonanza-test
 source "$IDF_PATH/export.sh"
 idf.py set-target esp32s3
+idf.py -DBONANZA_RP2040_FIRMWARE_BIN_INPUT=/absolute/path/to/firmware.bin build
+```
+
+### Option 2: Build From An RP2040 Cargo Repo
+
+```sh
+cd /Users/skot/Bitcoin/ESP-Miner/bonanza-test
+source "$IDF_PATH/export.sh"
+idf.py set-target esp32s3
+idf.py -DBONANZA_RP2040_FIRMWARE_REPO=/absolute/path/to/rp2040-firmware-repo build
+```
+
+The repo-based path should contain a release ELF at:
+
+- `target/thumbv6m-none-eabi/release/firmware`
+
+after `cargo build --release`.
+
+You can also set either input with environment variables instead of `-D` flags:
+
+```sh
+export BONANZA_RP2040_FIRMWARE_BIN=/absolute/path/to/firmware.bin
+```
+
+or:
+
+```sh
+export BONANZA_RP2040_FIRMWARE_REPO=/absolute/path/to/rp2040-firmware-repo
+```
+
+Then build normally:
+
+```sh
+cd /Users/skot/Bitcoin/ESP-Miner/bonanza-test
+source "$IDF_PATH/export.sh"
 idf.py build
 ```
+
+If you change the RP2040 firmware source after a previous configure, rerun `idf.py reconfigure build` or pass the new `-D...` option again so CMake updates the cached value.
 
 ## Flash
 
@@ -91,6 +150,15 @@ Type commands into the ESP-IDF monitor:
 
 `pattern` sends a small set of 9-bit test words over the data UART using the Bonanza byte-pair encoding.
 
+## Bring-Up Areas
+
+The firmware is organized around four practical bring-up areas:
+
+- `control/data UART`: validate the RP2040 serial firmware paths and Bonanza 9-bit data encoding
+- `vr`: configure, enable, and inspect the TPS546D24S regulator
+- `BZM_*`: exercise the ASIC chain using low-level BZM2 commands
+- `rpswd` / `rpflash`: inspect and reflash the RP2040 directly from the ESP32-S3
+
 The `vr` commands are intended for staged regulator bring-up:
 
 - `vr probe` reads the PMBus device ID at `0x24`
@@ -108,30 +176,31 @@ The harness does not auto-enable the regulator at boot. `GPIO10` is driven low d
 
 ## RP2040 SWD
 
-The harness now includes the first stage of an ESP32-driven RP2040 programming path:
+The harness includes an ESP32-driven RP2040 SWD and flashing path:
 
 - `rpflash info` shows the compile-time embedded `bitaxe-raw-bonanza` RP2040 firmware image
-- `rpflash write` halts both RP2040 cores, uploads a small SRAM flash stub, erases flash, programs the embedded firmware image page-by-page, verifies it, and issues a system reset
+- `rpflash write` halts both RP2040 cores, uploads a small SRAM flash stub, uploads the RP2040 firmware image into SRAM, erases and programs flash, verifies the result, and issues a system reset
 - `rpswd id` bit-bangs SWD on `GPIO1`/`GPIO2`, selects RP2040 multidrop targets, and reads each target `DPIDR`
 - `rpswd halt [core0|core1]` halts a core and shows `DHCSR`
 - `rpswd read32 <addr> [core0|core1]` reads a 32-bit word using the MEM-AP
 - `rpswd write32 <addr> <value> [core0|core1]` writes a 32-bit word using the MEM-AP
 
-The embedded RP2040 binary is generated at ESP-IDF build time from:
+This lets the ESP32-S3 act as a purpose-built RP2040 firmware loader for Bonanza board bring-up without needing an external probe attached during normal operation.
 
-- `/Users/skot/Bitcoin/bitaxe-raw/bitaxe-raw-bonanza`
+The embedded RP2040 firmware image can come from either:
 
-using `cargo build --release` and `arm-none-eabi-objcopy -O binary`.
+- `BONANZA_RP2040_FIRMWARE_BIN_INPUT`: a prebuilt `.bin`
+- `BONANZA_RP2040_FIRMWARE_REPO`: a Cargo repo that `bonanza-test` builds and exports to `.bin`
 
 The embedded SRAM flash helper is also built at ESP-IDF build time from:
 
-- `/Users/skot/Bitcoin/ESP-Miner/bonanza-test/main/rp2040_flash_stub.c`
+- [`main/rp2040_flash_stub.c`](main/rp2040_flash_stub.c)
 
 using the local `arm-none-eabi-gcc` toolchain.
 
 ## ASIC Commands
 
-The harness also includes direct BZM2 command helpers on the data UART, matching the Python bring-up scripts:
+The harness also includes direct BZM2 command helpers on the data UART, matching the Python bring-up scripts and intended for early ASIC-chain validation:
 
 - `BZM_sendnoop <asic>`
 - `BZM_readreg <asic> <engine_id> <offset> <count>`
