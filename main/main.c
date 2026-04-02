@@ -51,12 +51,24 @@
 #define BZM_REG_TEMPSENSOR_TUNECODE 0x30
 #define BZM_REG_TEMPSENSOR_TRIP_STATUS 0x31
 #define BZM_REG_TEMPSENSOR_TEMP_CODE_STATUS 0x32
+#define BZM_REG_SENSOR_THRS_CNT 0x3C
 #define BZM_REG_SENSOR_CLK_DIV 0x3D
+#define BZM_REG_VSENSOR_SRST_PD 0x3E
+#define BZM_REG_VSENSOR_CFG 0x3F
+#define BZM_REG_VOLTAGE_SENSOR_CTRL 0x40
+#define BZM_REG_VOLTAGE_SENSOR_STATUS 0x41
+#define BZM_REG_VOLTAGE_SENSOR_CH1_CH2_STATUS 0x44
+#define BZM_REG_BANDGAP 0x45
 #define BZM_REG_ASIC_ID 0x0B
 #define BZM_ADDRESS_BASE 0x42
 #define BZM_ADDRESS_CHIP_COUNT 4
 #define BZM_DEFAULT_THERMAL_SENSOR_DIV 8
+#define BZM_DEFAULT_VOLTAGE_SENSOR_DIV 8
 #define BZM_TEMP_SAMPLE_DELAY_MS 10
+#define BZM_VOLTAGE_SAMPLE_DELAY_MS 10
+#define BZM_VOLTAGE_SAMPLE_RETRY_DELAY_MS 5
+#define BZM_VOLTAGE_SAMPLE_MAX_ATTEMPTS 6
+#define BZM_VOLTAGE_SENSOR_GAP_COUNT 8
 
 #define CONTROL_PAGE_GPIO 0x06
 #define CONTROL_PAGE_FAN 0x09
@@ -138,6 +150,8 @@ static void print_help(void)
     printf("                    Write BZM register bytes, ex: BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00\n");
     printf("  BZM_temp <asic> [thermal_div]\n");
     printf("                    Read ASIC temperature, Bonanza default is 0x08 for 50 MHz, ex: BZM_temp 0x42\n");
+    printf("  BZM_voltage <asic> [voltage_div]\n");
+    printf("                    Read ASIC voltage sensor channels, Bonanza default is 0x08 for 50 MHz\n");
     printf("  BZM_addr4         Reset and address up to four ASICs as 0x42..0x45\n");
     printf("  BZM_probeall      Probe ASIC IDs 0x42..0x45 with NOOP and report responders\n");
     printf("  pattern           Send default 9-bit test pattern on data UART\n");
@@ -1364,6 +1378,30 @@ static float bzm_temp_code_to_celsius(uint16_t code)
     return -293.8f + (631.8f * (((float)code) - 0.5f) / 4096.0f);
 }
 
+static float bzm_voltage_code_to_mv(uint16_t code)
+{
+    // Match Intel's Blockscale reference SDK: 14-bit VM conversion mode.
+    return 1000.0f * 0.4f * 0.7067f * ((6.0f * (float)code / 16384.0f) - (3.0f / 16384.0f) - 1.0f);
+}
+
+static float bzm_voltage_code_to_mv_display(uint16_t code)
+{
+    float mv = bzm_voltage_code_to_mv(code);
+    return mv < 0.0f ? 0.0f : mv;
+}
+
+static uint16_t bzm_voltage_mv_to_code(float mv)
+{
+    float code = (16384.0f / 6.0f) * ((2.5f * mv / 706.7f) + (3.0f / 16384.0f) + 1.0f);
+    if (code < 0.0f) {
+        code = 0.0f;
+    }
+    if (code > 16383.0f) {
+        code = 16383.0f;
+    }
+    return (uint16_t)(code + 0.5f);
+}
+
 static bool bzm_parse_asic_id_readback(size_t word_count, uint8_t expected_id, uint8_t *reported_id, bool *chain_enabled)
 {
     if (word_count < 4) {
@@ -1794,6 +1832,244 @@ out:
     }
 }
 
+static void cmd_bzm_voltage(char *args)
+{
+    uint32_t parsed[2];
+    size_t parsed_count;
+    uint8_t asic;
+    uint8_t voltage_div = BZM_DEFAULT_VOLTAGE_SENSOR_DIV;
+    uint32_t original_clk_div = 0;
+    uint32_t original_vsensor_srst_pd = 0;
+    uint32_t original_vsensor_cfg = 0;
+    uint32_t original_vsensor_ctrl = 0;
+    uint32_t original_bandgap = 0;
+    uint32_t configured_clk_div = 0;
+    uint32_t configured_vsensor_srst_pd = 0;
+    uint32_t configured_vsensor_cfg = 0;
+    uint32_t configured_vsensor_ctrl = 0;
+    uint32_t configured_bandgap = 0;
+    uint32_t voltage_status = 0;
+    uint32_t voltage_ch1_ch2_status = 0;
+    uint32_t sample_attempts = 0;
+    esp_err_t err = ESP_OK;
+    esp_err_t restore_err = ESP_OK;
+    bool clk_div_changed = false;
+    bool vsensor_srst_pd_changed = false;
+    bool vsensor_cfg_changed = false;
+    bool vsensor_ctrl_changed = false;
+    bool bandgap_changed = false;
+    const uint16_t shutdown_code = bzm_voltage_mv_to_code(500.0f);
+
+    parsed_count = parse_hex_sequence(args, parsed, 2, 0xfff);
+    if (parsed_count < 1 || parsed_count > 2 || parsed[0] > 0xff) {
+        printf("usage: BZM_voltage <asic> [voltage_div]\n");
+        return;
+    }
+
+    if (parsed_count == 2) {
+        if (!bzm_is_valid_sensor_div(parsed[1])) {
+            printf("voltage_div must be between 0x02 and 0x10\n");
+            return;
+        }
+        voltage_div = (uint8_t)parsed[1];
+    }
+
+    asic = (uint8_t)parsed[0];
+
+    if (xSemaphoreTake(s_data_uart_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        printf("data uart busy\n");
+        return;
+    }
+
+    uart_flush_input(DATA_UART_PORT);
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_SENSOR_CLK_DIV, &original_clk_div, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VSENSOR_SRST_PD, &original_vsensor_srst_pd, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VSENSOR_CFG, &original_vsensor_cfg, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VOLTAGE_SENSOR_CTRL, &original_vsensor_ctrl, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_BANDGAP, &original_bandgap, 500);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+    configured_clk_div = (original_clk_div & ~0x1Fu) | (uint32_t)voltage_div;
+    configured_vsensor_srst_pd = (original_vsensor_srst_pd | (1u << 8)) & ~1u;
+    configured_vsensor_cfg = ((uint32_t)BZM_VOLTAGE_SENSOR_GAP_COUNT << 28) | (1u << 24);
+    configured_vsensor_ctrl = ((uint32_t)shutdown_code << 16) | ((uint32_t)shutdown_code << 1) | 1u;
+    configured_bandgap = (original_bandgap & ~0xFu) | 0x3u;
+
+    if (configured_clk_div != original_clk_div) {
+        err = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_SENSOR_CLK_DIV, configured_clk_div);
+        if (err != ESP_OK) {
+            goto out;
+        }
+        clk_div_changed = true;
+    }
+
+    if (configured_vsensor_srst_pd != original_vsensor_srst_pd) {
+        err = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VSENSOR_SRST_PD, configured_vsensor_srst_pd);
+        if (err != ESP_OK) {
+            goto out;
+        }
+        vsensor_srst_pd_changed = true;
+    }
+
+    if (configured_bandgap != original_bandgap) {
+        err = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_BANDGAP, configured_bandgap);
+        if (err != ESP_OK) {
+            goto out;
+        }
+        bandgap_changed = true;
+    }
+
+    if (configured_vsensor_cfg != original_vsensor_cfg) {
+        err = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VSENSOR_CFG, configured_vsensor_cfg);
+        if (err != ESP_OK) {
+            goto out;
+        }
+        vsensor_cfg_changed = true;
+    }
+
+    if (configured_vsensor_ctrl != original_vsensor_ctrl) {
+        err = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VOLTAGE_SENSOR_CTRL, configured_vsensor_ctrl);
+        if (err != ESP_OK) {
+            goto out;
+        }
+        vsensor_ctrl_changed = true;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(BZM_VOLTAGE_SAMPLE_DELAY_MS));
+
+    for (sample_attempts = 0; sample_attempts < BZM_VOLTAGE_SAMPLE_MAX_ATTEMPTS; sample_attempts++) {
+        err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VOLTAGE_SENSOR_STATUS, &voltage_status, 500);
+        if (err != ESP_OK) {
+            goto out;
+        }
+
+        err = bzm_read_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VOLTAGE_SENSOR_CH1_CH2_STATUS, &voltage_ch1_ch2_status, 500);
+        if (err != ESP_OK) {
+            goto out;
+        }
+
+        if (voltage_status != 0 || voltage_ch1_ch2_status != 0) {
+            break;
+        }
+
+        if ((sample_attempts + 1) < BZM_VOLTAGE_SAMPLE_MAX_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(BZM_VOLTAGE_SAMPLE_RETRY_DELAY_MS));
+        }
+    }
+
+out:
+    if (vsensor_ctrl_changed) {
+        esp_err_t tmp = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VOLTAGE_SENSOR_CTRL, original_vsensor_ctrl);
+        if (restore_err == ESP_OK && tmp != ESP_OK) {
+            restore_err = tmp;
+        }
+    }
+
+    if (vsensor_cfg_changed) {
+        esp_err_t tmp = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VSENSOR_CFG, original_vsensor_cfg);
+        if (restore_err == ESP_OK && tmp != ESP_OK) {
+            restore_err = tmp;
+        }
+    }
+
+    if (bandgap_changed) {
+        esp_err_t tmp = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_BANDGAP, original_bandgap);
+        if (restore_err == ESP_OK && tmp != ESP_OK) {
+            restore_err = tmp;
+        }
+    }
+
+    if (vsensor_srst_pd_changed) {
+        esp_err_t tmp = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_VSENSOR_SRST_PD, original_vsensor_srst_pd);
+        if (restore_err == ESP_OK && tmp != ESP_OK) {
+            restore_err = tmp;
+        }
+    }
+
+    if (clk_div_changed) {
+        esp_err_t tmp = bzm_write_u32_reg_locked(asic, BZM_BROADCAST_ENGINE_ID, BZM_REG_SENSOR_CLK_DIV, original_clk_div);
+        if (restore_err == ESP_OK && tmp != ESP_OK) {
+            restore_err = tmp;
+        }
+    }
+
+    xSemaphoreGive(s_data_uart_mutex);
+
+    if (err != ESP_OK) {
+        printf("BZM_voltage failed: %s\n", esp_err_to_name(err));
+        if (restore_err != ESP_OK) {
+            printf("warning: failed to restore sensor config: %s\n", esp_err_to_name(restore_err));
+        }
+        return;
+    }
+
+    {
+        uint16_t ch0_code = (uint16_t)(voltage_status & 0x3FFFu);
+        uint16_t ch1_code = (uint16_t)(voltage_ch1_ch2_status & 0x3FFFu);
+        uint16_t ch2_code = (uint16_t)((voltage_ch1_ch2_status >> 16) & 0x3FFFu);
+        bool ch0_shutdown = (voltage_status & (1u << 31)) != 0;
+        bool sensor_fault = (voltage_status & (1u << 30)) != 0;
+        bool ch1_shutdown = (voltage_status & (1u << 29)) != 0;
+        float ch0_mv = bzm_voltage_code_to_mv_display(ch0_code);
+        float ch1_mv = bzm_voltage_code_to_mv_display(ch1_code);
+        float ch2_mv = bzm_voltage_code_to_mv_display(ch2_code);
+        float total_mv = ch0_mv + ch1_mv + ch2_mv;
+
+        printf("BZM_voltage ASIC 0x%02X\n", asic);
+        printf("  voltage_div=0x%02X", voltage_div);
+        if (parsed_count == 1) {
+            printf(" (Bonanza default for 50 MHz ref clock)");
+        }
+        printf("\n");
+        printf("  SENSOR_CLK_DIV:   0x%08" PRIX32 " -> 0x%08" PRIX32 "\n", original_clk_div, configured_clk_div);
+        printf("  VSENSOR_SRST_PD:  0x%08" PRIX32 " -> 0x%08" PRIX32 "\n", original_vsensor_srst_pd, configured_vsensor_srst_pd);
+        printf("  VSENSOR_CFG:      0x%08" PRIX32 " -> 0x%08" PRIX32 "\n", original_vsensor_cfg, configured_vsensor_cfg);
+        printf("  VSENSOR_CTRL:     0x%08" PRIX32 " -> 0x%08" PRIX32 "\n", original_vsensor_ctrl, configured_vsensor_ctrl);
+        printf("  BANDGAP:          0x%08" PRIX32 " -> 0x%08" PRIX32 "\n", original_bandgap, configured_bandgap);
+        printf("  SAMPLE_ATTEMPTS:  %" PRIu32 "\n", sample_attempts + 1);
+        printf("  STATUS_CH0:       0x%08" PRIX32 "\n", voltage_status);
+        printf("  STATUS_CH1_CH2:   0x%08" PRIX32 "\n", voltage_ch1_ch2_status);
+        printf("  CH0_CODE:         %u (0x%04X) -> %.2f mV\n", ch0_code, ch0_code, ch0_mv);
+        printf("  CH1_CODE:         %u (0x%04X) -> %.2f mV\n", ch1_code, ch1_code, ch1_mv);
+        printf("  CH2_CODE:         %u (0x%04X) -> %.2f mV\n", ch2_code, ch2_code, ch2_mv);
+        printf("  TOTAL_STACK_MV:   %.2f mV\n", total_mv);
+        printf("  CH0_SHUTDOWN:     %u\n", ch0_shutdown ? 1 : 0);
+        printf("  CH1_SHUTDOWN:     %u\n", ch1_shutdown ? 1 : 0);
+        printf("  SENSOR_FAULT:     %u\n", sensor_fault ? 1 : 0);
+        printf("  note: CH0=bottom stack, CH1=top stack, CH2=inter-stack delta\n");
+        printf("  note: CH0 and CH1 are expected to be around 355 mV each on a ~700 mV ASIC rail\n");
+        printf("  note: voltages are Intel SDK uncalibrated on-die sensor values\n");
+        if (ch2_code == 0) {
+            printf("  note: CH2 raw code is zero, so it is shown as 0.00 mV instead of a fake negative value\n");
+        }
+        if (voltage_status == 0 && voltage_ch1_ch2_status == 0) {
+            printf("  note: all-zero status suggests the sensor had not finished a conversion before timeout\n");
+        }
+        if (restore_err != ESP_OK) {
+            printf("  restore_warning:  %s\n", esp_err_to_name(restore_err));
+        }
+    }
+}
+
 static void cmd_bzm_addr4(void)
 {
     uint8_t v5_en = 0;
@@ -2118,6 +2394,10 @@ void app_main(void)
             cmd_bzm_temp(&line[8]);
         } else if (strncmp(line, "BZM_temp ", 9) == 0) {
             cmd_bzm_temp(&line[9]);
+        } else if (strcmp(line, "BZM_voltage") == 0) {
+            cmd_bzm_voltage(&line[11]);
+        } else if (strncmp(line, "BZM_voltage ", 12) == 0) {
+            cmd_bzm_voltage(&line[12]);
         } else if (strcmp(line, "BZM_addr4") == 0) {
             cmd_bzm_addr4();
         } else if (strcmp(line, "BZM_probeall") == 0) {
