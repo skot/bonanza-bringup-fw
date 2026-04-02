@@ -116,6 +116,13 @@ static void print_help(void)
     printf("  vr op <0|1>       Write PMBus OPERATION off/on\n");
     printf("  rpflash info      Show embedded RP2040 firmware image info\n");
     printf("  rpswd id          Read RP2040 SWD DPIDR over GPIO1/GPIO2\n");
+    printf("  rpswd halt [core0|core1]\n");
+    printf("                    Halt an RP2040 core over SWD, default core0\n");
+    printf("  rpswd read32 <addr> [core0|core1]\n");
+    printf("                    Read a 32-bit word over SWD, ex: rpswd read32 0xE000ED00 core0\n");
+    printf("  rpswd write32 <addr> <value> [core0|core1]\n");
+    printf("                    Write a 32-bit word over SWD, ex: rpswd write32 0x20000000 0x12345678 core0\n");
+    printf("  rpflash write     Flash the embedded RP2040 firmware over SWD\n");
     printf("  BZM_sendnoop <asic>\n");
     printf("                    Send BZM NOOP to ASIC, ex: BZM_sendnoop 0xFA\n");
     printf("  BZM_readreg <asic> <engine> <offset> <count>\n");
@@ -226,6 +233,147 @@ static void cmd_rpswd_id(void)
     if (!any_success) {
         printf("rpswd id failed: no RP2040 SWD target responded\n");
     }
+}
+
+static bool parse_rpswd_core(const char *name, uint32_t *targetsel, const char **label)
+{
+    if (name == NULL || *name == '\0' || strcmp(name, "core0") == 0) {
+        if (targetsel != NULL) {
+            *targetsel = RP2040_TARGETSEL_CORE0;
+        }
+        if (label != NULL) {
+            *label = "core0";
+        }
+        return true;
+    }
+
+    if (strcmp(name, "core1") == 0) {
+        if (targetsel != NULL) {
+            *targetsel = RP2040_TARGETSEL_CORE1;
+        }
+        if (label != NULL) {
+            *label = "core1";
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static void cmd_rpswd_halt(const char *args)
+{
+    uint32_t targetsel;
+    uint32_t dhcsr = 0;
+    const char *label;
+    char core_name[16] = {0};
+    esp_err_t err;
+
+    if (args != NULL && *args != '\0') {
+        if (sscanf(args, "%15s", core_name) != 1) {
+            printf("usage: rpswd halt [core0|core1]\n");
+            return;
+        }
+    }
+
+    if (!parse_rpswd_core(core_name, &targetsel, &label)) {
+        printf("usage: rpswd halt [core0|core1]\n");
+        return;
+    }
+
+    err = swd_halt_core(targetsel, &dhcsr);
+    if (err != ESP_OK) {
+        printf("rpswd halt failed on %s: %s\n", label, esp_err_to_name(err));
+        return;
+    }
+
+    printf("rpswd halt %s:\n", label);
+    printf("  targetsel: 0x%08" PRIX32 "\n", targetsel);
+    printf("  dhcsr:     0x%08" PRIX32 "\n", dhcsr);
+    printf("  halted:    %s\n", ((dhcsr & (1u << 17)) != 0) ? "yes" : "no");
+}
+
+static void cmd_rpswd_read32(const char *args)
+{
+    char addr_str[32] = {0};
+    char core_name[16] = {0};
+    const char *label;
+    uint32_t targetsel;
+    uint32_t address;
+    uint32_t value = 0;
+    esp_err_t err;
+
+    if (args == NULL || sscanf(args, "%31s %15s", addr_str, core_name) < 1) {
+        printf("usage: rpswd read32 <addr> [core0|core1]\n");
+        return;
+    }
+
+    address = (uint32_t)strtoul(addr_str, NULL, 0);
+    if (!parse_rpswd_core(core_name, &targetsel, &label)) {
+        printf("usage: rpswd read32 <addr> [core0|core1]\n");
+        return;
+    }
+
+    err = swd_read_word32(targetsel, address, &value);
+    if (err != ESP_OK) {
+        printf("rpswd read32 failed on %s @ 0x%08" PRIX32 ": %s\n", label, address, esp_err_to_name(err));
+        return;
+    }
+
+    printf("rpswd read32 %s:\n", label);
+    printf("  addr:  0x%08" PRIX32 "\n", address);
+    printf("  value: 0x%08" PRIX32 "\n", value);
+}
+
+static void cmd_rpswd_write32(const char *args)
+{
+    char addr_str[32] = {0};
+    char value_str[32] = {0};
+    char core_name[16] = {0};
+    const char *label;
+    uint32_t targetsel;
+    uint32_t address;
+    uint32_t value;
+    esp_err_t err;
+
+    if (args == NULL || sscanf(args, "%31s %31s %15s", addr_str, value_str, core_name) < 2) {
+        printf("usage: rpswd write32 <addr> <value> [core0|core1]\n");
+        return;
+    }
+
+    address = (uint32_t)strtoul(addr_str, NULL, 0);
+    value = (uint32_t)strtoul(value_str, NULL, 0);
+    if (!parse_rpswd_core(core_name, &targetsel, &label)) {
+        printf("usage: rpswd write32 <addr> <value> [core0|core1]\n");
+        return;
+    }
+
+    err = swd_write_word32(targetsel, address, value);
+    if (err != ESP_OK) {
+        printf("rpswd write32 failed on %s @ 0x%08" PRIX32 ": %s\n", label, address, esp_err_to_name(err));
+        return;
+    }
+
+    printf("rpswd write32 %s:\n", label);
+    printf("  addr:  0x%08" PRIX32 "\n", address);
+    printf("  value: 0x%08" PRIX32 "\n", value);
+}
+
+static void cmd_rpflash_write(void)
+{
+    esp_err_t err;
+
+    printf("rpflash write:\n");
+    printf("  image size: %u bytes\n", (unsigned)swd_embedded_firmware_size());
+    printf("  target:     RP2040 core0/core1 via SWD\n");
+    fflush(stdout);
+
+    err = swd_flash_embedded_firmware();
+    if (err != ESP_OK) {
+        printf("  result:     failed (%s)\n", esp_err_to_name(err));
+        return;
+    }
+
+    printf("  result:     ok\n");
 }
 
 static esp_err_t uart_read_exact(uart_port_t port, uint8_t *buf, size_t len, uint32_t timeout_ms)
@@ -1740,6 +1888,16 @@ void app_main(void)
             cmd_rpflash_info();
         } else if (strcmp(line, "rpswd id") == 0) {
             cmd_rpswd_id();
+        } else if (strcmp(line, "rpswd halt") == 0) {
+            cmd_rpswd_halt("");
+        } else if (strncmp(line, "rpswd halt ", 11) == 0) {
+            cmd_rpswd_halt(&line[11]);
+        } else if (strncmp(line, "rpswd read32 ", 13) == 0) {
+            cmd_rpswd_read32(&line[13]);
+        } else if (strncmp(line, "rpswd write32 ", 14) == 0) {
+            cmd_rpswd_write32(&line[14]);
+        } else if (strcmp(line, "rpflash write") == 0) {
+            cmd_rpflash_write();
         } else if (strncmp(line, "BZM_sendnoop ", 13) == 0) {
             cmd_bzm_sendnoop(&line[13]);
         } else if (strncmp(line, "BZM_readreg ", 12) == 0) {

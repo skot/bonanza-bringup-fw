@@ -74,7 +74,11 @@ Type commands into the ESP-IDF monitor:
 - `vr pin 1`
 - `vr op 1`
 - `rpflash info`
+- `rpflash write`
 - `rpswd id`
+- `rpswd halt core0`
+- `rpswd read32 0xE000ED00 core0`
+- `rpswd write32 0x20000000 0x12345678 core0`
 - `BZM_sendnoop 0xFA`
 - `BZM_readreg 0xFA 0xFFF 0x0B 4`
 - `BZM_writereg 0xFA 0xFFF 0x0B 0x42 0x00 0x00 0x00`
@@ -107,13 +111,23 @@ The harness does not auto-enable the regulator at boot. `GPIO10` is driven low d
 The harness now includes the first stage of an ESP32-driven RP2040 programming path:
 
 - `rpflash info` shows the compile-time embedded `bitaxe-raw-bonanza` RP2040 firmware image
-- `rpswd id` bit-bangs SWD on `GPIO1`/`GPIO2`, selects RP2040 core 0, and reads the target `DPIDR`
+- `rpflash write` halts both RP2040 cores, uploads a small SRAM flash stub, erases flash, programs the embedded firmware image page-by-page, verifies it, and issues a system reset
+- `rpswd id` bit-bangs SWD on `GPIO1`/`GPIO2`, selects RP2040 multidrop targets, and reads each target `DPIDR`
+- `rpswd halt [core0|core1]` halts a core and shows `DHCSR`
+- `rpswd read32 <addr> [core0|core1]` reads a 32-bit word using the MEM-AP
+- `rpswd write32 <addr> <value> [core0|core1]` writes a 32-bit word using the MEM-AP
 
 The embedded RP2040 binary is generated at ESP-IDF build time from:
 
 - `/Users/skot/Bitcoin/bitaxe-raw/bitaxe-raw-bonanza`
 
 using `cargo build --release` and `arm-none-eabi-objcopy -O binary`.
+
+The embedded SRAM flash helper is also built at ESP-IDF build time from:
+
+- `/Users/skot/Bitcoin/ESP-Miner/bonanza-test/main/rp2040_flash_stub.c`
+
+using the local `arm-none-eabi-gcc` toolchain.
 
 ## ASIC Commands
 
